@@ -2,7 +2,7 @@
 
 > 参考 Claude Code v2.1.88 架构，使用 Qwen API 复现核心功能
 > 模型：qwen3-coder-plus | API：dashscope compatible mode
-> **原则：忠实于 Claude Code 源码，每个模块对应具体源文件**
+> 
 
 ---
 
