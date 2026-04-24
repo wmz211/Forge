@@ -1,0 +1,89 @@
+{
+  "name": "coding-agent",
+  "displayName": "CodingAgent",
+  "description": "AI coding assistant powered by Qwen — local ReAct agent with file/shell tools",
+  "version": "0.1.0",
+  "publisher": "coding-agent",
+  "engines": { "vscode": "^1.85.0" },
+  "categories": ["AI", "Other"],
+  "activationEvents": [],
+  "main": "./out/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "codingAgent.openChat",
+        "title": "CodingAgent: Open Chat",
+        "icon": "$(comment-discussion)"
+      },
+      {
+        "command": "codingAgent.clearChat",
+        "title": "CodingAgent: Clear Conversation"
+      },
+      {
+        "command": "codingAgent.startServer",
+        "title": "CodingAgent: Start Server"
+      },
+      {
+        "command": "codingAgent.stopServer",
+        "title": "CodingAgent: Stop Server"
+      }
+    ],
+    "menus": {
+      "editor/title": [
+        {
+          "command": "codingAgent.openChat",
+          "group": "navigation"
+        }
+      ]
+    },
+    "keybindings": [
+      {
+        "command": "codingAgent.openChat",
+        "key": "ctrl+shift+a",
+        "mac": "cmd+shift+a"
+      }
+    ],
+    "configuration": {
+      "title": "CodingAgent",
+      "properties": {
+        "codingAgent.serverPath": {
+          "type": "string",
+          "default": "",
+          "description": "Absolute path to the CodingAgent directory (containing server.py). Defaults to the workspace folder."
+        },
+        "codingAgent.pythonPath": {
+          "type": "string",
+          "default": "python",
+          "description": "Path to the Python executable used to run server.py"
+        },
+        "codingAgent.port": {
+          "type": "number",
+          "default": 8765,
+          "description": "Port the CodingAgent server listens on"
+        },
+        "codingAgent.apiKey": {
+          "type": "string",
+          "default": "",
+          "description": "API key for the LLM backend (overrides the value in server.py)"
+        },
+        "codingAgent.autoStart": {
+          "type": "boolean",
+          "default": true,
+          "description": "Automatically start the server when the chat panel is opened"
+        }
+      }
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run compile",
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "package": "npx @vscode/vsce package"
+  },
+  "devDependencies": {
+    "@types/vscode": "^1.85.0",
+    "@types/node": "^20.0.0",
+    "typescript": "^5.3.0",
+    "@vscode/vsce": "^2.24.0"
+  }
+}
