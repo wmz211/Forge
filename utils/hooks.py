@@ -721,11 +721,26 @@ async def execute_post_tool_use_hooks(
     ])
 
     display_messages: list[str] = []
+    additional_contexts: list[str] = []
+    updated_tool_output = None
     for (code, stdout, stderr), cmd in zip(results, commands):
         command_str = cmd["command"]
         succeeded = code == 0
         out = (stdout if succeeded else stderr).strip()
-        if out:
+        data = _parse_hook_json(stdout) if succeeded else None
+        if data:
+            if data.get("continue") is False:
+                display_messages.append(
+                    data.get("stopReason") or data.get("reason") or "Execution stopped by PostToolUse hook"
+                )
+            specific = data.get("hookSpecificOutput")
+            if isinstance(specific, dict) and specific.get("hookEventName") == "PostToolUse":
+                additional = specific.get("additionalContext")
+                if isinstance(additional, str) and additional:
+                    additional_contexts.append(additional)
+                if "updatedMCPToolOutput" in specific:
+                    updated_tool_output = specific.get("updatedMCPToolOutput")
+        elif out:
             if succeeded:
                 display_messages.append(
                     f"PostToolUse [{command_str}] completed: {out}"
@@ -735,6 +750,11 @@ async def execute_post_tool_use_hooks(
                     f"PostToolUse [{command_str}] failed: {out}"
                 )
 
-    return {
+    result = {
         "user_display_message": "\n".join(display_messages) if display_messages else None,
     }
+    if additional_contexts:
+        result["additional_context"] = "\n\n".join(additional_contexts)
+    if updated_tool_output is not None:
+        result["updated_tool_output"] = updated_tool_output
+    return result

@@ -426,6 +426,58 @@ class HookFidelityTests(unittest.TestCase):
             self.assertEqual(data["file_path"], "prehook-approved.txt")
             self.assertEqual(data["content"], "rewritten by prehook")
 
+    def test_post_tool_use_json_additional_context_is_appended_to_result(self):
+        class FakeReadTool(Tool):
+            name = "Read"
+            description = "fake read"
+            is_concurrency_safe = True
+
+            def get_schema(self):
+                return {"type": "object", "properties": {}}
+
+            async def call(self, input, ctx):
+                return "tool-result"
+
+        with tempfile.TemporaryDirectory() as tmp:
+            settings_dir = Path(tmp) / ".claude"
+            settings_dir.mkdir()
+            hook_output = {
+                "hookSpecificOutput": {
+                    "hookEventName": "PostToolUse",
+                    "additionalContext": "post-hook-context",
+                }
+            }
+            hook_file = Path(tmp) / "posthook-output.json"
+            hook_file.write_text(json.dumps(hook_output), encoding="utf-8")
+            command = f'cmd /c type "{hook_file}"' if os.name == "nt" else f"cat {hook_file}"
+            (settings_dir / "settings.json").write_text(json.dumps({
+                "hooks": {
+                    "PostToolUse": [
+                        {
+                            "matcher": "Read",
+                            "hooks": [{"type": "command", "command": command}],
+                        }
+                    ]
+                }
+            }), encoding="utf-8")
+
+            ctx = ToolContext(
+                cwd=tmp,
+                permission_mode="default",
+                confirm_fn=lambda *args: True,
+                session_id="sid",
+                session_transcript_path=Path(tmp) / "transcript.jsonl",
+            )
+            _, result = run(_run_tool({
+                "id": "tc1",
+                "name": "Read",
+                "arguments": {"file_path": "x.txt"},
+            }, {"Read": FakeReadTool()}, ctx))
+
+            self.assertIn("tool-result", result)
+            self.assertIn("hook_additional_context", result)
+            self.assertIn("post-hook-context", result)
+
 
 class BackgroundTaskFidelityTests(unittest.TestCase):
     def test_background_bash_output_is_retrievable_by_task_output(self):

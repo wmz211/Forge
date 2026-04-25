@@ -185,7 +185,7 @@ async def _run_tool(
 
     # PostToolUse hooks — mirrors executePostToolUseHooks() in query.ts.
     # Errors from PostToolUse hooks are non-blocking (logged but not surfaced to model).
-    await execute_post_tool_use_hooks(
+    post_hook = await execute_post_tool_use_hooks(
         tool_name=tc["name"],
         tool_input=tool_input,
         tool_response=result,
@@ -194,6 +194,16 @@ async def _run_tool(
         transcript_path=str(ctx.session_transcript_path),
         permission_mode=ctx.permission_mode,
     )
+    if post_hook.get("updated_tool_output") is not None:
+        updated = post_hook["updated_tool_output"]
+        result = updated if isinstance(updated, str) else str(updated)
+    if post_hook.get("additional_context"):
+        result = (
+            f"{result}\n\n"
+            f"<hook_additional_context event=\"PostToolUse\" tool=\"{tc['name']}\">\n"
+            f"{post_hook['additional_context']}\n"
+            f"</hook_additional_context>"
+        )
 
     return tc["id"], result
 
