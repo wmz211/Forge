@@ -18,7 +18,7 @@ sys.path.insert(0, os.path.dirname(__file__))
 import commands as cmd_registry
 
 from query_engine import QueryEngine
-from tools import AgentTool, build_builtin_tools
+from tools import AgentTool, build_builtin_tools_async
 from permissions import PERMISSION_MODES
 from ui import EventRenderer, render_error, render_warn
 
@@ -101,8 +101,8 @@ def _make_session() -> PromptSession:
     )
 
 
-def build_tools() -> list:
-    return build_builtin_tools()
+async def build_tools(cwd: str | None = None) -> list:
+    return await build_builtin_tools_async(cwd=cwd)
 
 
 async def run(args: argparse.Namespace) -> None:
@@ -111,7 +111,7 @@ async def run(args: argparse.Namespace) -> None:
         print(f"Error: cwd does not exist: {cwd}")
         sys.exit(1)
 
-    tools = build_tools()
+    tools = await build_tools(cwd)
 
     from services.api import QwenClient
     agent_api = QwenClient(api_key=API_KEY, model=MODEL)

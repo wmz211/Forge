@@ -13,7 +13,7 @@ from pathlib import Path
 from permissions import check_permission
 from tool import ToolContext
 from tool import Tool
-from tools import build_builtin_tools, core_tools_for_api
+from tools import build_builtin_tools, build_builtin_tools_async, core_tools_for_api
 from tools.ask_user_question_tool import AskUserQuestionTool
 from tools.bash_tool import BashTool
 from tools.file_read_tool import FileReadTool, MAX_SIZE_BYTES
@@ -625,6 +625,58 @@ class AgentToolFilteringFidelityTests(unittest.TestCase):
         ctx = ToolContext(cwd=".", permission_mode="default", confirm_fn=lambda *args: True)
         result = run(search.call({"query": "select:AskUserQuestion"}, ctx))
         self.assertIn("Missing requested tools: AskUserQuestion", result)
+
+
+class McpFidelityTests(unittest.TestCase):
+    def test_stdio_mcp_tools_are_discovered_and_callable(self):
+        async def scenario(tmp: str) -> tuple[list[str], str, str]:
+            server = Path(tmp) / "fake_mcp_server.py"
+            server.write_text(
+                "\n".join([
+                    "import json, sys",
+                    "for line in sys.stdin:",
+                    "    msg = json.loads(line)",
+                    "    method = msg.get('method')",
+                    "    if 'id' not in msg:",
+                    "        continue",
+                    "    if method == 'initialize':",
+                    "        result = {'protocolVersion': '2024-11-05', 'capabilities': {}, 'serverInfo': {'name': 'fake'}}",
+                    "    elif method == 'tools/list':",
+                    "        result = {'tools': [{'name': 'echo', 'description': 'Echo input text', 'inputSchema': {'type': 'object', 'properties': {'text': {'type': 'string'}}, 'required': ['text']}}]}",
+                    "    elif method == 'tools/call':",
+                    "        text = msg.get('params', {}).get('arguments', {}).get('text', '')",
+                    "        result = {'content': [{'type': 'text', 'text': 'echo:' + text}]}",
+                    "    else:",
+                    "        result = {}",
+                    "    print(json.dumps({'jsonrpc': '2.0', 'id': msg['id'], 'result': result}), flush=True)",
+                ]),
+                encoding="utf-8",
+            )
+            Path(tmp, ".mcp.json").write_text(json.dumps({
+                "mcpServers": {
+                    "local": {
+                        "type": "stdio",
+                        "command": sys.executable,
+                        "args": [str(server)],
+                    }
+                }
+            }), encoding="utf-8")
+
+            tools = await build_builtin_tools_async(cwd=tmp)
+            names = [tool.name for tool in tools]
+            tool = next(tool for tool in tools if tool.name == "mcp__local__echo")
+            ctx = ToolContext(cwd=tmp, permission_mode="default", confirm_fn=lambda *args: True)
+            output = await tool.call({"text": "hi"}, ctx)
+            search = next(tool for tool in tools if tool.name == "ToolSearch")
+            search_output = await search.call({"query": "select:mcp__local__echo"}, ctx)
+            return names, output, search_output
+
+        with tempfile.TemporaryDirectory() as tmp:
+            names, output, search_output = run(scenario(tmp))
+
+        self.assertIn("mcp__local__echo", names)
+        self.assertEqual("echo:hi", output)
+        self.assertIn("mcp__local__echo", search_output)
 
 
 if __name__ == "__main__":
