@@ -25,6 +25,7 @@ from typing import Any
 
 from utils.env_info import enhance_system_prompt
 from utils.file_state_cache import FileStateCache, create_empty_cache
+from utils.memory import inject_memory_into_system_prompt
 from tool import Tool, ToolContext
 
 
@@ -146,6 +147,7 @@ async def run_agent(
     file_state_cache: FileStateCache | None = None,
     worktree_path: str | None = None,
     fork_messages: list[dict] | None = None,
+    model_override: str | None = None,
 ) -> str:
     """
     Run a complete agent loop and return the accumulated text output.
@@ -175,10 +177,30 @@ async def run_agent(
     from permissions import make_confirm_fn
     from . import background as _bg
 
+    # ── 0. Model override (mirrors model parameter in AgentTool schema) ───────
+    # When the caller specifies a different model, spin up a fresh client for
+    # this agent run only — the parent client is unaffected.
+    # Mirrors the per-call model selection path in AgentTool.tsx.
+    effective_client = api_client
+    if model_override:
+        try:
+            from services.api import QwenClient
+            effective_client = QwenClient(
+                api_key=api_client._client.api_key,
+                model=model_override,
+                enable_thinking=getattr(api_client, "_thinking", None),
+            )
+        except Exception:
+            pass  # fall back to parent client if override fails
+
     # ── 1. System prompt enhancement (mirrors getAgentSystemPrompt()) ─────────
     # enhanceSystemPromptWithEnvDetails appends Notes + <env> block.
     # Sub-agents ALWAYS get this; main loop uses a richer prompt from prompts.ts.
     enhanced_prompt = await enhance_system_prompt(base_system_prompt, cwd)
+    # Memory snapshot: inject CLAUDE.md files discovered from the agent's cwd.
+    # Mirrors the getAttachments() / memory-file injection path in attachments.ts
+    # that runs for every agent query, including sub-agents.
+    enhanced_prompt = inject_memory_into_system_prompt(enhanced_prompt, cwd)
 
     # ── 2. File state cache ────────────────────────────────────────────────────
     # Fresh sub-agents get an empty cache; fork sub-agents inherit a clone.
@@ -262,7 +284,7 @@ async def run_agent(
     async for event in query_loop(
         messages=current_messages,
         tools=tools,
-        api_client=api_client,
+        api_client=effective_client,
         ctx=ctx,
         system_prompt=enhanced_prompt,
         max_turns=max_turns,

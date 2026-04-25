@@ -10,6 +10,17 @@ from .web_search_tool import WebSearchTool
 from .powershell_tool import PowerShellTool
 from .todo_write_tool import TodoWriteTool
 from .tool_search_tool import ToolSearchTool
+from .ask_user_question_tool import AskUserQuestionTool
+from .sleep_tool import SleepTool
+from .notebook_edit_tool import NotebookEditTool
+from .task_tools import (
+    TaskCreateTool,
+    TaskUpdateTool,
+    TaskGetTool,
+    TaskListTool,
+    TaskStopTool,
+    TaskOutputTool,
+)
 
 
 def build_builtin_tools(include_tool_search: bool = True) -> list:
@@ -24,6 +35,16 @@ def build_builtin_tools(include_tool_search: bool = True) -> list:
         WebSearchTool(),
         PowerShellTool(),
         TodoWriteTool(),
+        # Deferred tools — discovered via ToolSearch, not sent to the API by default.
+        AskUserQuestionTool(),
+        SleepTool(),
+        NotebookEditTool(),
+        TaskCreateTool(),
+        TaskUpdateTool(),
+        TaskGetTool(),
+        TaskListTool(),
+        TaskStopTool(),
+        TaskOutputTool(),
     ]
     if include_tool_search:
         tool_search = ToolSearchTool()
@@ -59,6 +80,15 @@ __all__ = [
     "PowerShellTool",
     "TodoWriteTool",
     "ToolSearchTool",
+    "AskUserQuestionTool",
+    "SleepTool",
+    "NotebookEditTool",
+    "TaskCreateTool",
+    "TaskUpdateTool",
+    "TaskGetTool",
+    "TaskListTool",
+    "TaskStopTool",
+    "TaskOutputTool",
     "build_builtin_tools",
     "core_tools_for_api",
 ]

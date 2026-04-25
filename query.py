@@ -1,5 +1,6 @@
 from __future__ import annotations
 import asyncio
+import time
 from typing import AsyncGenerator, Any, Callable
 
 from tool import Tool, ToolContext
@@ -7,6 +8,7 @@ from services.compact import (
     compact,
     calculate_token_warning_state,
     snip_compact_if_needed,
+    microcompact_messages,
 )
 from utils.tokens import token_count_with_estimation
 from utils.messages import (
@@ -17,7 +19,14 @@ from utils.messages import (
     normalize_messages_for_api,
 )
 from utils.tool_result_budget import apply_tool_result_budget
+from utils.hooks import (
+    execute_permission_request_hooks,
+    execute_pre_tool_use_hooks,
+    execute_post_tool_use_hooks,
+    execute_stop_hooks,
+)
 from tools import core_tools_for_api
+from permissions import check_permission
 
 DEFAULT_SYSTEM_PROMPT = """\
 You are an expert coding assistant with access to tools for reading, writing, \
@@ -87,30 +96,90 @@ async def _run_tool(
     if tool is None:
         return tc["id"], f"<error>Unknown tool: {tc['name']}</error>"
 
+    tool_input = tc["arguments"] if isinstance(tc.get("arguments"), dict) else {}
+
     desc = f"{tc['name']}({tc['arguments']})"
     try:
-        ok, validation_message = await tool.validate_input(
-            tc["arguments"] if isinstance(tc.get("arguments"), dict) else {},
-            ctx,
-        )
+        ok, validation_message = await tool.validate_input(tool_input, ctx)
     except Exception as e:
         ok, validation_message = False, str(e)
     if not ok:
         return tc["id"], f"<error>{validation_message or 'Invalid tool input'}</error>"
 
     if isinstance(tc.get("arguments"), dict):
-        args_for_permission = dict(tc["arguments"])
+        args_for_permission = dict(tool_input)
         args_for_permission["_cwd"] = ctx.cwd
         args_for_permission["_additional_working_directories"] = list(ctx.additional_working_directories)
     else:
         args_for_permission = None
-    if not ctx.confirm_fn(tc["name"], desc, args_for_permission):
-        return tc["id"], f"<error>Permission denied for {tc['name']}</error>"
+
+    # PreToolUse hooks — mirrors executePreToolUseHooks() in query.ts.
+    # A non-zero exit code from any hook blocks the tool call.
+    pre_hook = await execute_pre_tool_use_hooks(
+        tool_name=tc["name"],
+        tool_input=tool_input,
+        cwd=ctx.cwd,
+        session_id=ctx.session_id,
+        transcript_path=str(ctx.session_transcript_path),
+        permission_mode=ctx.permission_mode,
+    )
+    if pre_hook.get("block"):
+        reason = pre_hook.get("block_reason", "Blocked by PreToolUse hook")
+        return tc["id"], f"<error>{reason}</error>"
+
+    permission_result = check_permission(
+        tool_name=tc["name"],
+        mode=ctx.permission_mode,
+        tool_input=args_for_permission,
+        always_allow_rules=getattr(ctx, "always_allow", []),
+        always_deny_rules=getattr(ctx, "always_deny", []),
+        always_ask_rules=getattr(ctx, "always_ask", []),
+    )
+    hook_decision = None
+    if permission_result.get("behavior") == "ask" and args_for_permission is not None:
+        hook_decision = await execute_permission_request_hooks(
+            tool_name=tc["name"],
+            tool_input=args_for_permission,
+            permission_result=permission_result,
+            cwd=ctx.cwd,
+            session_id=ctx.session_id,
+            transcript_path=str(ctx.session_transcript_path),
+            permission_mode=ctx.permission_mode,
+        )
+
+    if hook_decision and hook_decision.get("behavior") == "deny":
+        message = hook_decision.get("message", f"Permission denied for {tc['name']}")
+        return tc["id"], f"<error>{message}</error>"
+
+    if hook_decision and hook_decision.get("behavior") == "allow":
+        updated = hook_decision.get("updatedInput")
+        if isinstance(updated, dict):
+            tool_input = {
+                k: v for k, v in updated.items()
+                if k not in ("_cwd", "_additional_working_directories")
+            }
+    elif permission_result.get("behavior") == "allow":
+        pass
+    else:
+        if not ctx.confirm_fn(tc["name"], desc, args_for_permission):
+            return tc["id"], f"<error>Permission denied for {tc['name']}</error>"
 
     try:
-        result = await tool.call(tc["arguments"], ctx)
+        result = await tool.call(tool_input, ctx)
     except Exception as e:
         result = f"<error>{e}</error>"
+
+    # PostToolUse hooks — mirrors executePostToolUseHooks() in query.ts.
+    # Errors from PostToolUse hooks are non-blocking (logged but not surfaced to model).
+    await execute_post_tool_use_hooks(
+        tool_name=tc["name"],
+        tool_input=tool_input,
+        tool_response=result,
+        cwd=ctx.cwd,
+        session_id=ctx.session_id,
+        transcript_path=str(ctx.session_transcript_path),
+        permission_mode=ctx.permission_mode,
+    )
 
     return tc["id"], result
 
@@ -124,9 +193,18 @@ async def query_loop(
     max_turns: int = MAX_TURNS,
     last_usage: dict | None = None,
     message_source: Callable[[], list[str]] | None = None,
+    stop_hook_active: bool = False,
 ) -> AsyncGenerator[dict, None]:
     """
     Core ReAct agent loop. Mirrors Claude Code's queryLoop() in query.ts.
+
+    Compaction pipeline (5 defenses, mirrors query.ts order):
+      [defense ①] applyToolResultBudget      — truncate oversized tool results
+      [defense ②] snipCompactIfNeeded        — remove stale middle messages
+      [defense ③] microcompactMessages       — time-based tool-result clearing
+      [defense ④] applyCollapsesIfNeeded     — not implemented (CONTEXT_COLLAPSE feature)
+      [check]     isAtBlockingLimit           — exit if still too full
+      [defense ⑤] autocompact (compact)      — full LLM summarisation
 
     last_usage: usage dict from the previous API response
       {'prompt_tokens': int, 'completion_tokens': int}
@@ -145,20 +223,6 @@ async def query_loop(
           stop           — no tool calls, model finished naturally
           max_turns      — hard turn limit reached
           blocking_limit — context at blocking threshold even after compaction
-
-    New in this revision
-    --------------------
-    Defense ① tool_result_budget:
-      Mirrors applyToolResultBudget() in query.ts — truncates oversized tool
-      results when context is above the warning threshold.  Runs BEFORE snip
-      (defense ②) on each iteration.
-
-    Max-output-tokens recovery (mirrors query.ts:1223):
-      When stop_reason == "length" (API hit MAX_OUTPUT_TOKENS), inject a meta
-      recovery message and continue the loop for up to MAX_OUTPUT_TOKENS_RECOVERY_LIMIT
-      additional iterations without consuming a turn slot.  After exhausting the
-      limit the partial assistant response is yielded normally and the loop
-      terminates.
     """
     tools_by_name = {t.name: t for t in tools}
     api_visible_tools = core_tools_for_api(tools) if tools else []
@@ -175,14 +239,6 @@ async def query_loop(
 
         # ── Compaction pipeline (mirrors queryLoop in query.ts) ──────────────
         #
-        # Correct source order (defenses run before the blocking check):
-        #   [defense ①] applyToolResultBudget      ← NEW: truncate oversized results
-        #   [defense ②] snipCompactIfNeeded        ← keep head+tail, drop middle
-        #   [defense ③] microcompact               — not yet implemented
-        #   [defense ④] applyCollapsesIfNeeded     — not yet implemented
-        #   [check]     isAtBlockingLimit           — exit if still too full
-        #   [defense ⑤] autocompact (isAboveAutoCompactThreshold)
-        #
         # Step A — extract only messages after the last compact boundary.
         # Mirrors: let messagesForQuery = [...getMessagesAfterCompactBoundary(messages)]
         messages_for_query = get_messages_after_compact_boundary(current_messages)
@@ -197,9 +253,16 @@ async def query_loop(
             messages_for_query, current_usage
         )
 
-        # Step C — blocking-limit check.
-        # Subtract snip_tokens_freed from the running estimate so a successful snip
-        # doesn't immediately re-trigger a heavier compaction step.
+        # Step C — [defense ③] time-based microcompact.
+        # Mirrors: microcompactMessages(messagesForQuery, toolUseContext, querySource)
+        # Clears old compactable tool results when the server cache has expired.
+        mc_result = microcompact_messages(messages_for_query)
+        messages_for_query = mc_result["messages"]
+        snip_tokens_freed += mc_result.get("tokens_saved", 0)
+
+        # Step D — blocking-limit check.
+        # Subtract snip_tokens_freed (snip + microcompact) from the running estimate
+        # so successful clearing doesn't immediately retrigger a heavier step.
         # Mirrors: calculateTokenWarningState(tokenCount - snipTokensFreed, model)
         _raw_count    = token_count_with_estimation(messages_for_query, current_usage)
         _token_count  = max(0, _raw_count - snip_tokens_freed)
@@ -214,22 +277,29 @@ async def query_loop(
             yield {"type": "done", "reason": "blocking_limit", "usage": current_usage}
             return
 
-        # Step D — [defense ⑤] autocompact when above the autocompact threshold.
-        # Runs AFTER the blocking check so we don't waste a summarisation call
-        # on a context that is already too large to recover from.
+        # Step E — [defense ⑤] autocompact when above the autocompact threshold.
         # Mirrors: isAtWarningLimit → runAutoCompact(messagesForQuery)
         if _warning_state["isAboveAutoCompactThreshold"]:
-            messages_for_query = await compact(messages_for_query, api_client)
+            pre_compact_token_count = _raw_count
+            compact_result = await compact(
+                messages_for_query,
+                api_client,
+                is_auto_compact=True,
+                pre_compact_token_count=pre_compact_token_count,
+                cwd=ctx.cwd,
+                session_id=ctx.session_id,
+                transcript_path=str(ctx.session_transcript_path),
+            )
             # Replace message history with the compacted slice.
-            # The compact boundary marker inside messages_for_query[0] will be
+            # The compact boundary marker inside compact_result[0] will be
             # found by get_messages_after_compact_boundary() on the next iteration.
-            current_messages = list(messages_for_query)
+            current_messages = list(compact_result)
             current_usage = None
             # Recalculate state with post-compact token count
             _token_count  = token_count_with_estimation(current_messages, current_usage)
             _warning_state = calculate_token_warning_state(_token_count)
 
-        # Step E — strip internal metadata keys before sending to the API.
+        # Step F — strip internal metadata keys before sending to the API.
         # Mirrors: normalizeMessagesForAPI(messagesForQuery) — removes fields like
         # _compact_boundary that are valid in our internal history but rejected by
         # the OpenAI-compat endpoint.
@@ -304,19 +374,44 @@ async def query_loop(
         # blocks and tool_use blocks (Anthropic content array → OpenAI content +
         # tool_calls fields).  text_buffer must not be silently dropped when
         # tool calls are present — pass it as the content field.
+        asst_msg: dict | None = None
         if tool_calls_this_turn:
             asst_msg = make_assistant_tool_call_message(
                 tool_calls_this_turn, text=text_buffer or None
             )
-            current_messages.append(asst_msg)
-            yield {"type": "assistant_message", "message": asst_msg}
         elif text_buffer:
             asst_msg = make_assistant_text_message(text_buffer)
+
+        if asst_msg is not None:
+            # Attach timestamp for time-based microcompact to measure inactivity gaps.
+            # Mirrors the timestamps stored on AssistantMessage in the source.
+            asst_msg["_timestamp"] = time.time()
             current_messages.append(asst_msg)
             yield {"type": "assistant_message", "message": asst_msg}
 
-        # ④ No tool calls → agent is done
+        # ④ No tool calls → check Stop hooks, then done
+        # Mirrors the Stop hook path in query.ts: executeStopHooks() is called
+        # when there are no tool calls; exit code 2 re-injects the feedback as a
+        # user message and continues the loop (model keeps working).
         if not tool_calls_this_turn:
+            stop_hook_result = await execute_stop_hooks(
+                last_assistant_message=text_buffer or None,
+                cwd=ctx.cwd,
+                session_id=ctx.session_id,
+                transcript_path=str(ctx.session_transcript_path),
+                permission_mode=ctx.permission_mode,
+                stop_hook_active=stop_hook_active,
+            )
+            if stop_hook_result.get("block"):
+                # Exit code 2 → inject feedback and let the model continue.
+                # Mirrors the re-injection path in query.ts for Stop hooks.
+                feedback = stop_hook_result.get("block_reason", "Stop hook requested continuation")
+                feedback_msg = {"role": "user", "content": feedback}
+                current_messages.append(feedback_msg)
+                yield {"type": "injected_message", "message": feedback_msg}
+                # Mark stop_hook_active so re-entrant Stop hooks can detect the cycle.
+                stop_hook_active = True
+                continue
             yield {"type": "done", "reason": "stop", "usage": current_usage}
             return
 

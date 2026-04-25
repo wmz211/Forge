@@ -6,8 +6,8 @@ Mirrors applyToolResultBudget() in src/utils/toolResultStorage.ts.
 Defense ① in the 5-defense compaction pipeline (query loop):
   ① applyToolResultBudget   ← this file
   ② snipCompactIfNeeded
-  ③ microcompact             (not implemented)
-  ④ applyCollapsesIfNeeded   (not implemented)
+  ③ microcompactMessages
+  ④ applyCollapsesIfNeeded   (not implemented — CONTEXT_COLLAPSE feature)
   ⑤ autocompact
 
 When the total token count exceeds the warning threshold, this function finds
@@ -15,27 +15,26 @@ tool-result messages that exceed a per-result size limit and replaces their
 content with a truncated version + a note.
 """
 
-import json
-
-from utils.tokens import estimate_tokens_for_messages, token_count_with_estimation
+from utils.tokens import rough_token_count, token_count_with_estimation
 from services.compact.auto_compact import calculate_token_warning_state
 
 # Per-result token cap applied when context is above warning threshold.
-# Mirrors MAX_TOOL_RESULT_TOKENS in toolResultStorage.ts.
+# Mirrors MAX_TOOL_RESULT_BYTES / BYTES_PER_TOKEN in toolLimits.ts:
+# DEFAULT_MAX_RESULT_SIZE_CHARS = 50_000 chars, which at ~4 chars/token ≈ 12_500 tokens.
+# The source uses MAX_TOOL_RESULT_BYTES (200_000 bytes) but we use a char limit.
 MAX_TOOL_RESULT_TOKENS = 10_000
+
+_TRUNCATION_NOTE = "\n\n[...output truncated by tool-result budget to fit context window...]"
 
 # Characters per token (fallback estimation)
 _CHARS_PER_TOKEN = 4
 
-_TRUNCATION_NOTE = "\n\n[...output truncated by tool-result budget to fit context window...]"
-
-
-def _token_estimate(text: str) -> int:
-    return max(1, len(text) // _CHARS_PER_TOKEN)
-
 
 def _truncate_result_content(content: str, max_tokens: int) -> str:
-    """Truncate a tool result to max_tokens, preserving the first portion."""
+    """
+    Truncate a tool result to max_tokens, preserving the first portion.
+    Mirrors the truncation logic in toolResultStorage.ts.
+    """
     max_chars = max_tokens * _CHARS_PER_TOKEN
     if len(content) <= max_chars:
         return content
@@ -77,7 +76,7 @@ def apply_tool_result_budget(
             result.append(msg)
             continue
 
-        if _token_estimate(content) <= MAX_TOOL_RESULT_TOKENS:
+        if rough_token_count(content) <= MAX_TOOL_RESULT_TOKENS:
             result.append(msg)
             continue
 

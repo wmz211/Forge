@@ -14,6 +14,7 @@ The JSONL approach means sessions survive crashes and are human-readable with
 import asyncio
 import json
 import os
+import time
 import uuid
 import re
 from pathlib import Path
@@ -38,6 +39,7 @@ from permission_rules import (
 from query import query_loop, DEFAULT_SYSTEM_PROMPT
 from utils.file_state_cache import FileStateCache, create_empty_cache
 from utils.memory import inject_memory_into_system_prompt
+from utils.hooks import execute_session_start_hooks, execute_user_prompt_submit_hooks
 
 
 # ── Path helpers (mirrors sanitizePath() + getProjectDir()) ─
@@ -132,6 +134,138 @@ def _load_jsonl(path: Path) -> list[dict]:
     return entries
 
 
+def _write_session_header(path: Path, session_id: str, cwd: str, model: str) -> None:
+    """
+    Write a `summary` header entry at the start of a new session.
+    Mirrors the initial header write in sessionStorage.ts.
+    Recorded fields are used by get_sessions() for filtering without full parse.
+    """
+    entry = {
+        "type": "summary",
+        "sessionId": session_id,
+        "cwd": cwd,
+        "model": model,
+        "createdAt": time.time(),
+    }
+    _append_entry(path, entry)
+
+
+def _write_heartbeat(path: Path, session_id: str) -> None:
+    """
+    Append a heartbeat entry to signal the session is still active.
+    Mirrors writeHeartbeat() in sessionStorage.ts — used by session GC / listing
+    to distinguish live sessions from stale ones.
+    """
+    entry = {
+        "type": "heartbeat",
+        "sessionId": session_id,
+        "timestamp": time.time(),
+    }
+    _append_entry(path, entry)
+
+
+def get_sessions(
+    cwd: str | None = None,
+    model: str | None = None,
+    since: float | None = None,
+    limit: int = 20,
+) -> list[dict]:
+    """
+    Return session metadata for the sessions directory, optionally filtered.
+    Mirrors getSessions(filter?) in sessionStorage.ts.
+
+    Reads the first `summary` entry from each JSONL to get metadata without
+    loading the full transcript.  Falls back to mtime when no header exists
+    (for sessions created before this improvement was added).
+
+    Filter parameters:
+      cwd   — exact cwd match
+      model — model name match
+      since — only sessions with createdAt >= since (epoch seconds)
+      limit — max results (newest first)
+    """
+    projects_dir = _get_projects_dir()
+    sessions: list[dict] = []
+
+    if not projects_dir.exists():
+        return sessions
+
+    for jsonl in sorted(
+        projects_dir.rglob("*.jsonl"),
+        key=lambda p: p.stat().st_mtime,
+        reverse=True,
+    ):
+        # Skip archived sessions
+        if "archived" in jsonl.parts:
+            continue
+
+        meta: dict = {
+            "sessionId": jsonl.stem,
+            "path": str(jsonl),
+            "cwd": None,
+            "model": None,
+            "createdAt": jsonl.stat().st_mtime,
+            "lastActivity": jsonl.stat().st_mtime,
+            "messageCount": 0,
+        }
+
+        # Read header entry for structured metadata
+        try:
+            with open(jsonl, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        entry = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if entry.get("type") == "summary":
+                        meta["cwd"] = entry.get("cwd")
+                        meta["model"] = entry.get("model")
+                        meta["createdAt"] = entry.get("createdAt", meta["createdAt"])
+                    elif entry.get("type") == "message":
+                        meta["messageCount"] += 1
+                    elif entry.get("type") == "heartbeat":
+                        meta["lastActivity"] = max(
+                            meta["lastActivity"],
+                            entry.get("timestamp", 0),
+                        )
+        except OSError:
+            pass
+
+        # Apply filters
+        if cwd is not None and meta["cwd"] != cwd:
+            continue
+        if model is not None and meta["model"] != model:
+            continue
+        if since is not None and meta["createdAt"] < since:
+            continue
+
+        sessions.append(meta)
+        if len(sessions) >= limit:
+            break
+
+    return sessions
+
+
+def archive_session(session_path: Path) -> bool:
+    """
+    Move a session JSONL to an `archived/` subdirectory.
+    Mirrors archiveSession() in sessionStorage.ts.
+    Returns True on success.
+    """
+    if not session_path.exists():
+        return False
+    archive_dir = session_path.parent / "archived"
+    archive_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        session_path.rename(archive_dir / session_path.name)
+        return True
+    except OSError:
+        return False
+
+
 # ── QueryEngine ───────────────────────────────────────────────────────────────
 
 class QueryEngine:
@@ -189,6 +323,7 @@ class QueryEngine:
         self._transcript_path = _get_transcript_path(cwd, self.session_id)
 
         self._api = QwenClient(api_key=api_key, model=model)
+        self._model = model
         self._messages: list[dict] = []
         self._last_usage: dict | None = None
         self._todos: dict[str, list[dict]] = {}
@@ -204,10 +339,23 @@ class QueryEngine:
         # Mirrors toolUseContext.abortController in QueryEngine.ts.
         self._abort_event: asyncio.Event = asyncio.Event()
 
+        is_new = not self._transcript_path.exists()
         self._load_session()
+        if is_new:
+            # Write session header so get_sessions() can read metadata without
+            # loading the full transcript.  Mirrors the summary header write in
+            # sessionStorage.ts on first session creation.
+            _write_session_header(self._transcript_path, self.session_id, cwd, model)
 
         # Wire abort_event into every AgentTool in the pool
         self._wire_abort_event()
+
+    # ── Public properties ─────────────────────────────────────────────────────
+
+    @property
+    def transcript_path(self) -> Path:
+        """Public alias for the session transcript path. Mirrors sessionStorage.transcriptPath."""
+        return self._transcript_path
 
     # ── Abort chain ───────────────────────────────────────────────────────────
 
@@ -371,9 +519,39 @@ class QueryEngine:
         Submit a user message and stream back events.
         State (message history) persists across calls via JSONL.
         """
+        # Execute UserPromptSubmit hooks before processing the prompt.
+        # Mirrors executeUserPromptSubmitHooks() called in processUserInput.ts.
+        # Exit code 2 blocks the prompt; successful stdout is additional context.
+        _prompt_hook = await execute_user_prompt_submit_hooks(
+            prompt=prompt,
+            cwd=self.cwd,
+            session_id=self.session_id,
+            transcript_path=str(self._transcript_path),
+            permission_mode=self.permission_mode,
+        )
+        if _prompt_hook.get("block"):
+            reason = _prompt_hook.get("block_reason", "Blocked by UserPromptSubmit hook")
+            yield {"type": "text", "content": f"[Hook blocked prompt]: {reason}"}
+            yield {"type": "done", "reason": "hook_blocked", "usage": self._last_usage}
+            return
+
         user_msg = {"role": "user", "content": prompt}
         self._messages.append(user_msg)
         self._save_message(user_msg)
+
+        # Inject hook additional_context as a system note before the user message.
+        # Mirrors the hook_additional_context attachment in processUserInput.ts.
+        if _prompt_hook.get("additional_context"):
+            _ctx_msg = {
+                "role": "user",
+                "content": f"[Hook additional context]: {_prompt_hook['additional_context']}",
+            }
+            self._messages.append(_ctx_msg)
+
+        # Heartbeat: signal this session is still active before each turn.
+        # Mirrors writeHeartbeat() called at the start of each query in
+        # sessionStorage.ts — used by session listing to distinguish live vs stale.
+        _write_heartbeat(self._transcript_path, self.session_id)
 
         # Reset abort state from any previous Ctrl+C before each new submission
         if self._abort_event.is_set():
@@ -435,6 +613,27 @@ class QueryEngine:
                 continue
 
             yield event
+
+    async def process_session_start_hooks(
+        self,
+        source: str = "startup",
+        model: str | None = None,
+    ) -> list[dict]:
+        """
+        Execute SessionStart hooks and return any hook result messages.
+        Mirrors processSessionStartHooks() in sessionStart.ts.
+
+        source is one of: "startup", "resume", "clear", "compact"
+        Hook messages are returned as dicts — callers can inject them into the
+        conversation or display them in the UI.
+        """
+        return await execute_session_start_hooks(
+            source=source,  # type: ignore[arg-type]
+            cwd=self.cwd,
+            session_id=self.session_id,
+            transcript_path=str(self._transcript_path),
+            model=model,
+        )
 
     def clear(self) -> None:
         """

@@ -161,3 +161,37 @@ def inject_memory_into_system_prompt(system_prompt: str, cwd: str) -> str:
     if not memory:
         return system_prompt
     return system_prompt + memory
+
+
+def get_memory_file_entries(cwd: str) -> list[dict]:
+    """
+    Return a deduplicated list of memory file entries for display.
+    Each entry: {"path": Path, "label": str, "content": str}
+
+    Mirrors the getMemoryFileContents() path in Claude Code that lists
+    individual files for the /memory command — uses the same discovery
+    order and deduplication as load_memory_files().
+    """
+    seen: set[Path] = set()
+    entries: list[dict] = []
+
+    for candidate in _candidate_paths(cwd):
+        try:
+            resolved = candidate.resolve()
+        except OSError:
+            continue
+
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+
+        label = _relative_label(resolved, cwd)
+        content = _read_file_safe(resolved) if resolved.exists() else None
+        entries.append({
+            "path": resolved,
+            "label": label,
+            "content": content,
+            "exists": resolved.exists(),
+        })
+
+    return entries

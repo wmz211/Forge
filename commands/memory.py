@@ -2,12 +2,14 @@
 /memory [show|edit] — Manage CLAUDE.md memory files.
 Mirrors Claude Code's /memory command in commands/memory/.
 
-Claude Code reads CLAUDE.md files from:
+Claude Code reads CLAUDE.md files from (in load order):
   ~/.claude/CLAUDE.md         (global user memory)
-  <cwd>/CLAUDE.md             (project memory)
+  <ancestors>/CLAUDE.md       (parent directories up to home)
+  <cwd>/CLAUDE.md             (project root)
   <cwd>/.claude/CLAUDE.md     (local project memory)
+  <cwd>/**/.claude/CLAUDE.md  (subdirectory memory files, depth ≤ 3)
 
-/memory        — show contents of all memory files
+/memory        — show contents of all discovered memory files
 /memory edit   — open the project CLAUDE.md in $EDITOR (or notepad on Windows)
 """
 from __future__ import annotations
@@ -21,21 +23,11 @@ import commands as _reg
 _MEMORY_FILE = "CLAUDE.md"
 
 
-def _memory_paths(cwd: str) -> list[Path]:
-    home = Path.home()
-    return [
-        home / ".claude" / _MEMORY_FILE,        # global
-        Path(cwd) / _MEMORY_FILE,               # project root
-        Path(cwd) / ".claude" / _MEMORY_FILE,   # project local
-    ]
-
-
 async def call(args: str, engine) -> str:
     sub = args.strip().lower()
-    paths = _memory_paths(engine.cwd)
 
     if sub == "edit":
-        # Find or create the project-level CLAUDE.md
+        # Open the project-level CLAUDE.md (most specific non-global location)
         target = Path(engine.cwd) / _MEMORY_FILE
         target.touch(exist_ok=True)
         editor = os.environ.get("EDITOR", "notepad" if sys.platform == "win32" else "nano")
@@ -45,29 +37,40 @@ async def call(args: str, engine) -> str:
             return f"  \033[31mCould not open editor:\033[0m {e}\n  File: {target}"
         return f"  \033[32mEditor closed.\033[0m Memory file: {target}"
 
-    # Default: show all memory files
+    # Default: show all discovered memory files using full discovery logic.
+    # Uses get_memory_file_entries() which mirrors getMemoryFileContents() in
+    # Claude Code — same candidate path list, same deduplication.
+    from utils.memory import get_memory_file_entries
+    entries = get_memory_file_entries(engine.cwd)
+
     lines = ["\033[1mMemory files:\033[0m\n"]
     found_any = False
-    for path in paths:
-        marker = "(global)" if ".claude" in str(path.parent) and path.parent == Path.home() / ".claude" else "(project)"
-        if path.exists():
+
+    for entry in entries:
+        path = entry["path"]
+        label = entry["label"]
+        exists = entry["exists"]
+        content = entry["content"]
+
+        if exists and content is not None:
             found_any = True
-            content = path.read_text(encoding="utf-8", errors="replace").strip()
-            lines.append(f"  \033[36m{path}\033[0m  {marker}")
+            lines.append(f"  \033[36m{path}\033[0m  ({label})")
             if content:
                 for line in content.splitlines()[:20]:
                     lines.append(f"    {line}")
                 if len(content.splitlines()) > 20:
-                    lines.append(f"    \033[90m... ({len(content.splitlines())} lines total)\033[0m")
+                    lines.append(
+                        f"    \033[90m... ({len(content.splitlines())} lines total)\033[0m"
+                    )
             else:
                 lines.append("    \033[90m(empty)\033[0m")
             lines.append("")
         else:
-            lines.append(f"  \033[90m{path}  {marker}  — not found\033[0m")
+            lines.append(f"  \033[90m{path}  ({label})  — not found\033[0m")
 
     if not found_any:
         lines.append("  No CLAUDE.md files found.")
-        lines.append(f"  Create one with: /memory edit")
+        lines.append("  Create one with: /memory edit")
 
     return "\n".join(lines)
 

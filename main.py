@@ -150,6 +150,16 @@ async def run(args: argparse.Namespace) -> None:
     print(f"  log     : {engine.transcript_path}")
     print()
 
+    # Fire SessionStart hooks (mirrors processSessionStartHooks() in sessionStart.ts).
+    # "resume" when restoring an existing session, "startup" for new sessions.
+    _session_source = "resume" if engine._messages else "startup"
+    _hook_msgs = await engine.process_session_start_hooks(
+        source=_session_source, model=MODEL
+    )
+    for _hm in _hook_msgs:
+        if _hm.get("output"):
+            print(f"[SessionStart hook] {_hm['output']}")
+
     renderer = EventRenderer(tools=tools)
     session = _make_session()
 

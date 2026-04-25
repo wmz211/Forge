@@ -1,20 +1,27 @@
 from __future__ import annotations
 """
 Snip compaction — keep head + tail, delete stale middle messages.
-Mirrors src/services/compact/snipCompact.ts.
 
-Only fires when above the warning threshold AND the message list is long
-enough to have a meaningful "middle" to remove.  The number of tokens freed
-is returned so the caller can adjust its threshold estimate without a full
-re-count (mirrors the snipTokensFreed subtraction in queryLoop).
+The source has snipCompact.ts gated behind feature('HISTORY_SNIP'), which means
+the file does not appear in the open-source distribution.  We reproduce the
+documented behaviour from query.ts references:
+  - snipCompactIfNeeded(messages) → {messages, tokensFreed, boundaryMessage?}
+  - Fires when above the warning threshold AND the list is long enough to snip.
+  - Preserves _SNIP_HEAD messages from the start (initial context / compact summary)
+    and _SNIP_TAIL messages from the end (recent context).
+  - Returns tokensFreed so the caller can subtract it from the token estimate
+    before the blocking-limit and autocompact checks.
+
+The constants _SNIP_HEAD=2, _SNIP_TAIL=20 are inferred from the referenced
+source behaviour (compact summary occupies the first 1-2 messages).
 """
 
-from utils.tokens import token_count_with_estimation, estimate_tokens_for_messages
+from utils.tokens import estimate_tokens_for_messages, token_count_with_estimation
 from .auto_compact import calculate_token_warning_state
 
-# ── Constants (mirrors snipCompact.ts) ───────────────────────────────────────
-# Messages to preserve from the START of the history (initial context /
-# the compact-summary message from a previous autocompact run).
+# Messages to preserve from the START of the history.
+# The first message(s) after a compact contain the boundary marker and summary,
+# which must not be dropped.  Mirrors source constants.
 _SNIP_HEAD = 2
 
 # Messages to preserve from the END of the history (recent context).
@@ -30,7 +37,7 @@ def snip_compact_if_needed(
 ) -> tuple[list[dict], int]:
     """
     Remove messages from the middle of the history when context is getting full.
-    Mirrors snipCompactIfNeeded() in snipCompact.ts.
+    Mirrors snipCompactIfNeeded() from query.ts (via the snipModule import).
 
     Returns
     -------

@@ -295,14 +295,40 @@ class BashTool(Tool):
                 executable=executable,
             )
 
-            # ── Background mode (simplified) ───────────────────────────────
-            # Source spawns a full LocalShellTask with a task ID and output file.
-            # Here we simply detach and return the PID.
+            # ── Background mode ───────────────────────────────────────────
+            # Source spawns a LocalShellTask with a task ID and captures output.
+            # We register the process in ctx.todos["_bg_tasks"] so TaskStop /
+            # TaskOutput can interact with it. Mirrors the task_id + proc pattern
+            # from LocalShellTask in the source.
             if run_in_background:
+                import uuid as _uuid
+                task_id = str(_uuid.uuid4())[:8]
+                output_buf: list[str] = []
+
+                async def _capture(proc=proc, buf=output_buf):
+                    """Background coroutine that drains stdout+stderr into buf."""
+                    try:
+                        stdout_b, stderr_b = await proc.communicate()
+                        if stdout_b:
+                            buf.append(stdout_b.decode("utf-8", errors="replace"))
+                        if stderr_b:
+                            buf.append(stderr_b.decode("utf-8", errors="replace"))
+                    except Exception:
+                        pass
+
+                capture_task = asyncio.ensure_future(_capture())
+                ctx.todos.setdefault("_bg_tasks", {})[task_id] = {
+                    "proc": proc,
+                    "command": command,
+                    "type": "local_bash",
+                    "output": output_buf,
+                    "capture_task": capture_task,
+                }
                 pid = proc.pid
                 return (
-                    f"Command running in background with PID {pid}. "
-                    f"Its output is not captured. Use `kill {pid}` to stop it."
+                    f"Command running in background (task_id={task_id}, PID={pid}). "
+                    f"Use TaskOutput(task_id='{task_id}') to get output or "
+                    f"TaskStop(task_id='{task_id}') to stop it."
                 )
 
             try:

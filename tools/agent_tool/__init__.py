@@ -40,6 +40,32 @@ from .worktree import create_worktree, remove_worktree
 from . import background as _bg
 from utils.file_state_cache import create_empty_cache
 
+ASYNC_AGENT_ALLOWED_TOOLS = frozenset({
+    "Read",
+    "WebSearch",
+    "TodoWrite",
+    "Grep",
+    "WebFetch",
+    "Glob",
+    "Bash",
+    "PowerShell",
+    "Edit",
+    "Write",
+    "NotebookEdit",
+    "ToolSearch",
+})
+
+ALL_AGENT_DISALLOWED_TOOLS = frozenset({
+    "Agent",
+    "AskUserQuestion",
+    "TaskOutput",
+    "TaskStop",
+    "TaskCreate",
+    "TaskGet",
+    "TaskList",
+    "TaskUpdate",
+})
+
 
 # ── Tool-pool helpers ─────────────────────────────────────────────────────────
 
@@ -51,18 +77,29 @@ def _resolve_tools(
     Apply allowlist / denylist from an AgentDefinition to a tool pool.
     Mirrors filterToolsForAgent() + resolveAgentTools() in agentToolUtils.ts.
     """
-    if definition is None:
-        return list(pool)
+    pool = [
+        t for t in pool
+        if t.name in ASYNC_AGENT_ALLOWED_TOOLS and t.name not in ALL_AGENT_DISALLOWED_TOOLS
+    ]
 
-    if definition.tools is None or definition.tools == ["*"]:
+    if definition is None:
+        tools = list(pool)
+    elif definition.tools is None or definition.tools == ["*"]:
         tools = list(pool)
     else:
         allow = set(definition.tools)
         tools = [t for t in pool if t.name in allow]
 
-    if definition.disallowed_tools:
+    if definition and definition.disallowed_tools:
         deny = set(definition.disallowed_tools)
         tools = [t for t in tools if t.name not in deny]
+
+    for tool in tools:
+        if tool.name == "ToolSearch" and hasattr(tool, "set_tools"):
+            try:
+                tool.set_tools(tools)
+            except Exception:
+                pass
 
     return tools
 
@@ -161,6 +198,13 @@ class AgentTool(Tool):
                         "so the agent works on an isolated copy of the repo."
                     ),
                 },
+                "model": {
+                    "type": "string",
+                    "description": (
+                        "Optional model override for this agent. Takes precedence over "
+                        "the agent definition's model. If omitted, inherits from the parent."
+                    ),
+                },
             },
             "required": ["description", "prompt"],
         }
@@ -214,6 +258,7 @@ class AgentTool(Tool):
         subagent_type: str = input.get("subagent_type") or "general-purpose"
         run_in_bg: bool   = bool(input.get("run_in_background", False))
         isolation: str | None = input.get("isolation")
+        model_override: str | None = input.get("model") or None
 
         # Abort check before even starting
         if self._abort_event.is_set():
@@ -277,6 +322,7 @@ class AgentTool(Tool):
                     worktree_branch=worktree_branch,
                     session_transcript_path=session_transcript_path,
                     parent_session_id=parent_session_id,
+                    model_override=model_override,
                 )
 
             result = await run_agent(
@@ -298,6 +344,7 @@ class AgentTool(Tool):
                 abort_event=self._abort_event,
                 file_state_cache=create_empty_cache(),
                 worktree_path=worktree_dir,
+                model_override=model_override,
             )
 
             print(f"  {badge} Done.")
@@ -343,6 +390,7 @@ class AgentTool(Tool):
         worktree_branch: str | None,
         session_transcript_path: Path,
         parent_session_id: str,
+        model_override: str | None = None,
     ) -> str:
         """
         Fire-and-forget via asyncio.create_task().
@@ -381,6 +429,7 @@ class AgentTool(Tool):
                     abort_event=task_record.abort_event,
                     file_state_cache=create_empty_cache(),
                     worktree_path=worktree_dir,
+                    model_override=model_override,
                 )
                 _bg.complete_task(bg_agent_id, result)
                 print(f"\n  {badge} Background agent completed: {description}")
