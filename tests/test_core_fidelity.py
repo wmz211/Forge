@@ -478,6 +478,109 @@ class HookFidelityTests(unittest.TestCase):
             self.assertIn("hook_additional_context", result)
             self.assertIn("post-hook-context", result)
 
+    def test_post_tool_use_failure_hook_additional_context_is_appended(self):
+        class FailingTool(Tool):
+            name = "Read"
+            description = "failing read"
+
+            def get_schema(self):
+                return {"type": "object", "properties": {}}
+
+            async def call(self, input, ctx):
+                raise RuntimeError("tool exploded")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            settings_dir = Path(tmp) / ".claude"
+            settings_dir.mkdir()
+            hook_output = {
+                "hookSpecificOutput": {
+                    "hookEventName": "PostToolUseFailure",
+                    "additionalContext": "failure-context",
+                }
+            }
+            hook_file = Path(tmp) / "failure-hook.json"
+            hook_file.write_text(json.dumps(hook_output), encoding="utf-8")
+            command = f'cmd /c type "{hook_file}"' if os.name == "nt" else f"cat {hook_file}"
+            (settings_dir / "settings.json").write_text(json.dumps({
+                "hooks": {
+                    "PostToolUseFailure": [
+                        {
+                            "matcher": "Read",
+                            "hooks": [{"type": "command", "command": command}],
+                        }
+                    ]
+                }
+            }), encoding="utf-8")
+
+            ctx = ToolContext(
+                cwd=tmp,
+                permission_mode="default",
+                confirm_fn=lambda *args: True,
+                session_id="sid",
+                session_transcript_path=Path(tmp) / "transcript.jsonl",
+            )
+            _, result = run(_run_tool({
+                "id": "tc1",
+                "name": "Read",
+                "arguments": {"file_path": "x.txt"},
+            }, {"Read": FailingTool()}, ctx))
+
+            self.assertIn("<error>tool exploded</error>", result)
+            self.assertIn("hook_additional_context", result)
+            self.assertIn("failure-context", result)
+
+    def test_permission_denied_hook_retry_message_is_appended(self):
+        class FakeWriteTool(Tool):
+            name = "Write"
+            description = "fake write"
+
+            def get_schema(self):
+                return {"type": "object", "properties": {}}
+
+            async def call(self, input, ctx):
+                return "should not run"
+
+        with tempfile.TemporaryDirectory() as tmp:
+            settings_dir = Path(tmp) / ".claude"
+            settings_dir.mkdir()
+            hook_output = {
+                "hookSpecificOutput": {
+                    "hookEventName": "PermissionDenied",
+                    "retry": True,
+                    "additionalContext": "permission-denied-context",
+                }
+            }
+            hook_file = Path(tmp) / "permission-denied-hook.json"
+            hook_file.write_text(json.dumps(hook_output), encoding="utf-8")
+            command = f'cmd /c type "{hook_file}"' if os.name == "nt" else f"cat {hook_file}"
+            (settings_dir / "settings.json").write_text(json.dumps({
+                "hooks": {
+                    "PermissionDenied": [
+                        {
+                            "matcher": "Write",
+                            "hooks": [{"type": "command", "command": command}],
+                        }
+                    ]
+                }
+            }), encoding="utf-8")
+
+            ctx = ToolContext(
+                cwd=tmp,
+                permission_mode="default",
+                confirm_fn=lambda *args: False,
+                session_id="sid",
+                session_transcript_path=Path(tmp) / "transcript.jsonl",
+            )
+            _, result = run(_run_tool({
+                "id": "tc1",
+                "name": "Write",
+                "arguments": {"file_path": "x.txt", "content": "x"},
+            }, {"Write": FakeWriteTool()}, ctx))
+
+            self.assertIn("Permission denied", result)
+            self.assertIn("may retry", result)
+            self.assertIn("permission-denied-context", result)
+
 
 class BackgroundTaskFidelityTests(unittest.TestCase):
     def test_background_bash_output_is_retrievable_by_task_output(self):

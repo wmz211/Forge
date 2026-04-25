@@ -21,6 +21,8 @@ from utils.messages import (
 from utils.tool_result_budget import apply_tool_result_budget
 from utils.hooks import (
     execute_permission_request_hooks,
+    execute_permission_denied_hooks,
+    execute_post_tool_use_failure_hooks,
     execute_pre_tool_use_hooks,
     execute_post_tool_use_hooks,
     execute_stop_hooks,
@@ -104,7 +106,17 @@ async def _run_tool(
     except Exception as e:
         ok, validation_message = False, str(e)
     if not ok:
-        return tc["id"], f"<error>{validation_message or 'Invalid tool input'}</error>"
+        error = validation_message or "Invalid tool input"
+        failure_hook = await execute_post_tool_use_failure_hooks(
+            tool_name=tc["name"],
+            tool_input=tool_input,
+            error=error,
+            cwd=ctx.cwd,
+            session_id=ctx.session_id,
+            transcript_path=str(ctx.session_transcript_path),
+            permission_mode=ctx.permission_mode,
+        )
+        return tc["id"], _append_hook_context(f"<error>{error}</error>", tc["name"], "PostToolUseFailure", failure_hook)
 
     if isinstance(tc.get("arguments"), dict):
         args_for_permission = dict(tool_input)
@@ -163,7 +175,16 @@ async def _run_tool(
 
     if hook_decision and hook_decision.get("behavior") == "deny":
         message = hook_decision.get("message", f"Permission denied for {tc['name']}")
-        return tc["id"], f"<error>{message}</error>"
+        denied_hook = await execute_permission_denied_hooks(
+            tool_name=tc["name"],
+            tool_input=args_for_permission,
+            denial_message=message,
+            cwd=ctx.cwd,
+            session_id=ctx.session_id,
+            transcript_path=str(ctx.session_transcript_path),
+            permission_mode=ctx.permission_mode,
+        )
+        return tc["id"], _format_permission_denied_result(tc["name"], message, denied_hook)
 
     if hook_decision and hook_decision.get("behavior") == "allow":
         updated = hook_decision.get("updatedInput")
@@ -176,12 +197,32 @@ async def _run_tool(
         pass
     else:
         if not ctx.confirm_fn(tc["name"], desc, args_for_permission):
-            return tc["id"], f"<error>Permission denied for {tc['name']}</error>"
+            message = f"Permission denied for {tc['name']}"
+            denied_hook = await execute_permission_denied_hooks(
+                tool_name=tc["name"],
+                tool_input=args_for_permission,
+                denial_message=message,
+                cwd=ctx.cwd,
+                session_id=ctx.session_id,
+                transcript_path=str(ctx.session_transcript_path),
+                permission_mode=ctx.permission_mode,
+            )
+            return tc["id"], _format_permission_denied_result(tc["name"], message, denied_hook)
 
     try:
         result = await tool.call(tool_input, ctx)
     except Exception as e:
-        result = f"<error>{e}</error>"
+        error = str(e)
+        failure_hook = await execute_post_tool_use_failure_hooks(
+            tool_name=tc["name"],
+            tool_input=tool_input,
+            error=error,
+            cwd=ctx.cwd,
+            session_id=ctx.session_id,
+            transcript_path=str(ctx.session_transcript_path),
+            permission_mode=ctx.permission_mode,
+        )
+        return tc["id"], _append_hook_context(f"<error>{error}</error>", tc["name"], "PostToolUseFailure", failure_hook)
 
     # PostToolUse hooks — mirrors executePostToolUseHooks() in query.ts.
     # Errors from PostToolUse hooks are non-blocking (logged but not surfaced to model).
@@ -198,14 +239,27 @@ async def _run_tool(
         updated = post_hook["updated_tool_output"]
         result = updated if isinstance(updated, str) else str(updated)
     if post_hook.get("additional_context"):
-        result = (
-            f"{result}\n\n"
-            f"<hook_additional_context event=\"PostToolUse\" tool=\"{tc['name']}\">\n"
-            f"{post_hook['additional_context']}\n"
-            f"</hook_additional_context>"
-        )
+        result = _append_hook_context(result, tc["name"], "PostToolUse", post_hook)
 
     return tc["id"], result
+
+
+def _append_hook_context(result: str, tool_name: str, event: str, hook_result: dict | None) -> str:
+    if not hook_result or not hook_result.get("additional_context"):
+        return result
+    return (
+        f"{result}\n\n"
+        f"<hook_additional_context event=\"{event}\" tool=\"{tool_name}\">\n"
+        f"{hook_result['additional_context']}\n"
+        f"</hook_additional_context>"
+    )
+
+
+def _format_permission_denied_result(tool_name: str, message: str, hook_result: dict | None) -> str:
+    result = f"<error>{message}</error>"
+    if hook_result and hook_result.get("retry"):
+        result += "\nThe PermissionDenied hook indicated this command is now approved. You may retry it if you would like."
+    return _append_hook_context(result, tool_name, "PermissionDenied", hook_result)
 
 
 async def query_loop(

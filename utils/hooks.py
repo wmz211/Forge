@@ -758,3 +758,118 @@ async def execute_post_tool_use_hooks(
     if updated_tool_output is not None:
         result["updated_tool_output"] = updated_tool_output
     return result
+
+
+async def execute_post_tool_use_failure_hooks(
+    tool_name: str,
+    tool_input: dict,
+    error: str,
+    cwd: str,
+    session_id: str = "",
+    transcript_path: str = "",
+    permission_mode: str | None = None,
+) -> dict:
+    """
+    Execute PostToolUseFailure hooks for a failed tool call.
+    Mirrors executePostToolUseFailureHooks() in hooks.ts.
+    """
+    hooks_config = _load_hooks_config(cwd)
+    commands = _get_matching_commands(hooks_config, "PostToolUseFailure", tool_name)
+    if not commands:
+        return {}
+
+    hook_input = {
+        **_base_hook_input(cwd, session_id, transcript_path, permission_mode),
+        "hook_event_name": "PostToolUseFailure",
+        "tool_name": tool_name,
+        "tool_input": tool_input,
+        "error": error,
+    }
+
+    results = await asyncio.gather(*[
+        _execute_hook_command_async(
+            cmd["command"],
+            hook_input,
+            timeout=cmd.get("timeout", 60.0),
+        )
+        for cmd in commands
+    ])
+
+    additional_contexts: list[str] = []
+    display_messages: list[str] = []
+    for code, stdout, stderr in results:
+        succeeded = code == 0
+        out = (stdout if succeeded else stderr).strip()
+        data = _parse_hook_json(stdout) if succeeded else None
+        if data:
+            specific = data.get("hookSpecificOutput")
+            if isinstance(specific, dict) and specific.get("hookEventName") == "PostToolUseFailure":
+                additional = specific.get("additionalContext")
+                if isinstance(additional, str) and additional:
+                    additional_contexts.append(additional)
+        elif out:
+            display_messages.append(out)
+
+    result = {
+        "user_display_message": "\n".join(display_messages) if display_messages else None,
+    }
+    if additional_contexts:
+        result["additional_context"] = "\n\n".join(additional_contexts)
+    return result
+
+
+async def execute_permission_denied_hooks(
+    tool_name: str,
+    tool_input: dict | None,
+    denial_message: str,
+    cwd: str,
+    session_id: str = "",
+    transcript_path: str = "",
+    permission_mode: str | None = None,
+) -> dict:
+    """
+    Execute PermissionDenied hooks.
+    Mirrors executePermissionDeniedHooks() in hooks.ts. Forge supports the
+    JSON hookSpecificOutput retry flag and additionalContext.
+    """
+    hooks_config = _load_hooks_config(cwd)
+    commands = _get_matching_commands(hooks_config, "PermissionDenied", tool_name)
+    if not commands:
+        return {}
+
+    hook_input = {
+        **_base_hook_input(cwd, session_id, transcript_path, permission_mode),
+        "hook_event_name": "PermissionDenied",
+        "tool_name": tool_name,
+        "tool_input": tool_input or {},
+        "message": denial_message,
+    }
+
+    results = await asyncio.gather(*[
+        _execute_hook_command_async(
+            cmd["command"],
+            hook_input,
+            timeout=cmd.get("timeout", 60.0),
+        )
+        for cmd in commands
+    ])
+
+    retry = False
+    additional_contexts: list[str] = []
+    for code, stdout, _stderr in results:
+        if code != 0:
+            continue
+        data = _parse_hook_json(stdout)
+        if not data:
+            continue
+        specific = data.get("hookSpecificOutput")
+        if isinstance(specific, dict) and specific.get("hookEventName") == "PermissionDenied":
+            retry = retry or bool(specific.get("retry"))
+            additional = specific.get("additionalContext")
+            if isinstance(additional, str) and additional:
+                additional_contexts.append(additional)
+
+    result: dict = {"retry": retry}
+    if additional_contexts:
+        result["additional_context"] = "\n\n".join(additional_contexts)
+    return result
