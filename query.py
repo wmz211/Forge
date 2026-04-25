@@ -126,6 +126,16 @@ async def _run_tool(
     if pre_hook.get("block"):
         reason = pre_hook.get("block_reason", "Blocked by PreToolUse hook")
         return tc["id"], f"<error>{reason}</error>"
+    pre_hook_allows = pre_hook.get("permission_decision") == "allow"
+    updated_input = pre_hook.get("updated_input")
+    if isinstance(updated_input, dict):
+        tool_input = {
+            k: v for k, v in updated_input.items()
+            if k not in ("_cwd", "_additional_working_directories")
+        }
+        args_for_permission = dict(tool_input)
+        args_for_permission["_cwd"] = ctx.cwd
+        args_for_permission["_additional_working_directories"] = list(ctx.additional_working_directories)
 
     permission_result = check_permission(
         tool_name=tc["name"],
@@ -136,7 +146,11 @@ async def _run_tool(
         always_ask_rules=getattr(ctx, "always_ask", []),
     )
     hook_decision = None
-    if permission_result.get("behavior") == "ask" and args_for_permission is not None:
+    if (
+        not pre_hook_allows
+        and permission_result.get("behavior") == "ask"
+        and args_for_permission is not None
+    ):
         hook_decision = await execute_permission_request_hooks(
             tool_name=tc["name"],
             tool_input=args_for_permission,
@@ -158,7 +172,7 @@ async def _run_tool(
                 k: v for k, v in updated.items()
                 if k not in ("_cwd", "_additional_working_directories")
             }
-    elif permission_result.get("behavior") == "allow":
+    elif pre_hook_allows or permission_result.get("behavior") == "allow":
         pass
     else:
         if not ctx.confirm_fn(tc["name"], desc, args_for_permission):

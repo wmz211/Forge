@@ -370,6 +370,62 @@ class HookFidelityTests(unittest.TestCase):
             self.assertEqual(data["file_path"], "hook-approved.txt")
             self.assertEqual(data["content"], "updated by hook")
 
+    def test_pre_tool_use_json_can_allow_and_rewrite_input(self):
+        class FakeWriteTool(Tool):
+            name = "Write"
+            description = "fake write"
+
+            def get_schema(self):
+                return {"type": "object", "properties": {}}
+
+            async def call(self, input, ctx):
+                return json.dumps(input)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            settings_dir = Path(tmp) / ".claude"
+            settings_dir.mkdir()
+            hook_output = {
+                "hookSpecificOutput": {
+                    "hookEventName": "PreToolUse",
+                    "permissionDecision": "allow",
+                    "permissionDecisionReason": "trusted rewrite",
+                    "updatedInput": {
+                        "file_path": "prehook-approved.txt",
+                        "content": "rewritten by prehook",
+                    },
+                }
+            }
+            hook_file = Path(tmp) / "prehook-output.json"
+            hook_file.write_text(json.dumps(hook_output), encoding="utf-8")
+            command = f'cmd /c type "{hook_file}"' if os.name == "nt" else f"cat {hook_file}"
+            (settings_dir / "settings.json").write_text(json.dumps({
+                "hooks": {
+                    "PreToolUse": [
+                        {
+                            "matcher": "Write",
+                            "hooks": [{"type": "command", "command": command}],
+                        }
+                    ]
+                }
+            }), encoding="utf-8")
+
+            ctx = ToolContext(
+                cwd=tmp,
+                permission_mode="default",
+                confirm_fn=lambda *args: False,
+                session_id="sid",
+                session_transcript_path=Path(tmp) / "transcript.jsonl",
+            )
+            _, result = run(_run_tool({
+                "id": "tc1",
+                "name": "Write",
+                "arguments": {"file_path": "original.txt", "content": "original"},
+            }, {"Write": FakeWriteTool()}, ctx))
+
+            data = json.loads(result)
+            self.assertEqual(data["file_path"], "prehook-approved.txt")
+            self.assertEqual(data["content"], "rewritten by prehook")
+
 
 class BackgroundTaskFidelityTests(unittest.TestCase):
     def test_background_bash_output_is_retrievable_by_task_output(self):

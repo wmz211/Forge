@@ -426,6 +426,38 @@ async def execute_pre_tool_use_hooks(
                 "block_reason": out or f"Blocked by hook: {command_str}",
                 "user_display_message": "\n".join(display_messages),
             }
+        data = _parse_hook_json(stdout) if succeeded else None
+        if data:
+            if data.get("continue") is False:
+                return {
+                    "block": True,
+                    "block_reason": data.get("stopReason") or data.get("reason") or "Blocked by PreToolUse hook",
+                    "user_display_message": "\n".join(display_messages) if display_messages else None,
+                }
+            if data.get("decision") == "block":
+                return {
+                    "block": True,
+                    "block_reason": data.get("reason") or "Blocked by PreToolUse hook",
+                    "user_display_message": "\n".join(display_messages) if display_messages else None,
+                }
+            specific = data.get("hookSpecificOutput")
+            if isinstance(specific, dict) and specific.get("hookEventName") == "PreToolUse":
+                permission_decision = specific.get("permissionDecision")
+                if permission_decision in ("deny", "ask"):
+                    return {
+                        "block": True,
+                        "block_reason": specific.get("permissionDecisionReason") or "Blocked by PreToolUse hook",
+                        "permission_decision": permission_decision,
+                        "user_display_message": "\n".join(display_messages) if display_messages else None,
+                    }
+                if permission_decision == "allow" or specific.get("updatedInput"):
+                    return {
+                        "block": False,
+                        "permission_decision": permission_decision,
+                        "updated_input": specific.get("updatedInput"),
+                        "additional_context": specific.get("additionalContext"),
+                        "user_display_message": "\n".join(display_messages) if display_messages else None,
+                    }
         if out:
             display_messages.append(
                 f"PreToolUse [{command_str}] completed: {out}"
