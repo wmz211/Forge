@@ -2,6 +2,7 @@ from __future__ import annotations
 import asyncio
 import os
 import re
+import shlex
 import sys
 from typing import Any
 
@@ -50,15 +51,128 @@ _BLOCKING_SLEEP_RE = re.compile(r"^sleep\s+(\d+)\s*$")
 _ENV_VAR_RE = re.compile(r"^[A-Za-z_]\w*=")
 
 
+def _tokens(part: str) -> list[str]:
+    try:
+        return shlex.split(part, posix=True)
+    except ValueError:
+        return part.strip().split()
+
+
+def _strip_leading_env(tokens: list[str]) -> list[str]:
+    while tokens and _ENV_VAR_RE.match(tokens[0]):
+        tokens = tokens[1:]
+    return tokens
+
+
+def _strip_env_command(tokens: list[str]) -> list[str]:
+    if not tokens or tokens[0] != "env":
+        return tokens
+    tokens = tokens[1:]
+    while tokens:
+        token = tokens[0]
+        if token in ("-i", "-0"):
+            tokens = tokens[1:]
+            continue
+        if token in ("-u", "-C", "-S") and len(tokens) > 1:
+            tokens = tokens[2:]
+            continue
+        if token.startswith("-"):
+            tokens = tokens[1:]
+            continue
+        if _ENV_VAR_RE.match(token):
+            tokens = tokens[1:]
+            continue
+        break
+    return tokens
+
+
+def _strip_safe_wrappers(tokens: list[str]) -> list[str]:
+    tokens = _strip_leading_env(tokens)
+    changed = True
+    while changed and tokens:
+        changed = False
+        if tokens[0] == "env":
+            new_tokens = _strip_env_command(tokens)
+            changed = new_tokens != tokens
+            tokens = _strip_leading_env(new_tokens)
+        elif tokens[0] == "timeout" and len(tokens) >= 3:
+            i = 1
+            while i < len(tokens) and tokens[i].startswith("-"):
+                i += 2 if tokens[i] in ("-k", "--kill-after", "-s", "--signal") and i + 1 < len(tokens) else 1
+            if i < len(tokens):
+                i += 1
+            tokens = _strip_leading_env(tokens[i:])
+            changed = True
+        elif tokens[0] == "nice" and len(tokens) >= 2:
+            i = 1
+            if i < len(tokens) and tokens[i] == "-n" and i + 1 < len(tokens):
+                i += 2
+            elif i < len(tokens) and re.match(r"^-\d+$", tokens[i]):
+                i += 1
+            tokens = _strip_leading_env(tokens[i:])
+            changed = True
+        elif tokens[0] in ("nohup", "time") and len(tokens) >= 2:
+            tokens = _strip_leading_env(tokens[1:])
+            changed = True
+    return tokens
+
+
 # ── Helper utilities ────────────────────────────────────────────────────────
 
 def _split_command_parts(command: str) -> list[str]:
     """
     Split compound command on ||, &&, |, ; to get individual subcommands.
-    Simplified (no quote awareness), matching splitCommandWithOperators intent.
+    Quote-aware enough to avoid splitting operators inside single/double quotes.
+    This mirrors the intent of splitCommandWithOperators without a full shell AST.
     Returns a flat list of subcommand strings (operators stripped out).
     """
-    parts = re.split(r"\|\||&&|[|;]", command)
+    parts: list[str] = []
+    buf: list[str] = []
+    quote: str | None = None
+    escaped = False
+    i = 0
+    while i < len(command):
+        ch = command[i]
+        if escaped:
+            buf.append(ch)
+            escaped = False
+            i += 1
+            continue
+        if ch == "\\":
+            buf.append(ch)
+            escaped = True
+            i += 1
+            continue
+        if quote:
+            buf.append(ch)
+            if ch == quote:
+                quote = None
+            i += 1
+            continue
+        if ch in ("'", '"'):
+            quote = ch
+            buf.append(ch)
+            i += 1
+            continue
+        if command.startswith("&&", i) or command.startswith("||", i):
+            part = "".join(buf).strip()
+            if part:
+                parts.append(part)
+            buf = []
+            i += 2
+            continue
+        if ch in "|;":
+            part = "".join(buf).strip()
+            if part:
+                parts.append(part)
+            buf = []
+            i += 1
+            continue
+        buf.append(ch)
+        i += 1
+    part = "".join(buf).strip()
+    if part:
+        parts.append(part)
     return [p.strip() for p in parts if p.strip()]
 
 
@@ -67,9 +181,7 @@ def _base_command(part: str) -> str:
     Extract the base command name from a command segment, skipping leading
     VAR=value assignments (mirrors ENV_VAR_ASSIGN_RE logic in bashPermissions.ts).
     """
-    for tok in part.strip().split():
-        if _ENV_VAR_RE.match(tok):
-            continue
+    for tok in _strip_safe_wrappers(_tokens(part)):
         # Handle paths like /usr/bin/grep → grep
         return os.path.basename(tok)
     return ""
@@ -158,6 +270,27 @@ def detect_blocking_sleep(command: str) -> str | None:
     return f"sleep {secs} followed by: {rest}" if rest else f"standalone sleep {secs}"
 
 
+def _validate_command(command: str) -> str | None:
+    sleep_pattern = detect_blocking_sleep(command)
+    if sleep_pattern is not None:
+        return (
+            f"Blocked: {sleep_pattern}. "
+            "Run blocking commands in the background with run_in_background: true - "
+            "you'll get a completion notification when done. "
+            "If you genuinely need a short delay (rate limiting, pacing), "
+            "keep it under 2 seconds."
+        )
+
+    if _DANGEROUS_DEVICE_RE.search(command):
+        return (
+            "Command accesses a potentially blocking device file "
+            "(/dev/stdin, /dev/zero, /dev/urandom, /dev/random, /dev/full). "
+            "These may block forever. Use explicit alternatives instead."
+        )
+
+    return None
+
+
 # ── Tool implementation ─────────────────────────────────────────────────────
 
 class BashTool(Tool):
@@ -239,6 +372,12 @@ class BashTool(Tool):
         """
         return self.is_read_only(input)
 
+    async def validate_input(self, input: dict[str, Any], ctx: ToolContext) -> tuple[bool, str | None]:
+        error = _validate_command(str(input.get("command", "")))
+        if error is not None:
+            return False, error
+        return True, None
+
     def render_call_summary(self, args: dict[str, Any]) -> str | None:
         """
         Show the description field if present, otherwise the command (truncated).
@@ -252,6 +391,9 @@ class BashTool(Tool):
 
     async def call(self, input: dict[str, Any], ctx: ToolContext) -> str:
         command: str = input["command"]
+        validation_error = _validate_command(command)
+        if validation_error is not None:
+            return f"<error>{validation_error}</error>"
 
         # ── Input validation (mirrors validateInput() in BashTool.tsx) ────────
         sleep_pattern = detect_blocking_sleep(command)

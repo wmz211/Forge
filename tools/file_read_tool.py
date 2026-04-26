@@ -294,6 +294,7 @@ class FileReadTool(Tool):
 
         # ── Format: cat -n style (line_number TAB content) ─────────────────
         # Mirrors addLineNumbers() in file.ts
+        raw_selected = "".join(selected)
         numbered = "".join(f"{start + i + 1}\t{line}" for i, line in enumerate(selected))
 
         # ── Char-based output cap (mirrors maxTokens * 4 chars/token) ──────
@@ -331,7 +332,7 @@ class FileReadTool(Tool):
         ctx.file_state_cache.set(
             path,
             FileState(
-                content=numbered,
+                content=raw_selected,
                 offset=offset if start > 0 else None,
                 limit=limit,
                 is_partial_view=is_partial,

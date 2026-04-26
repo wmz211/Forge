@@ -19,6 +19,7 @@ from dataclasses import dataclass
 import fnmatch
 import os
 import re
+import shlex
 from typing import Any
 
 
@@ -150,15 +151,126 @@ _POWERSHELL_READ_CMDS = frozenset({
 })
 
 
+def _tokens(part: str) -> list[str]:
+    try:
+        return shlex.split(part, posix=True)
+    except ValueError:
+        return part.strip().split()
+
+
+def _strip_leading_env(tokens: list[str]) -> list[str]:
+    while tokens and _ENV_VAR_RE.match(tokens[0]):
+        tokens = tokens[1:]
+    return tokens
+
+
+def _strip_env_command(tokens: list[str]) -> list[str]:
+    if not tokens or tokens[0] != "env":
+        return tokens
+    tokens = tokens[1:]
+    while tokens:
+        token = tokens[0]
+        if token in ("-i", "-0"):
+            tokens = tokens[1:]
+            continue
+        if token in ("-u", "-C", "-S") and len(tokens) > 1:
+            tokens = tokens[2:]
+            continue
+        if token.startswith("-"):
+            tokens = tokens[1:]
+            continue
+        if _ENV_VAR_RE.match(token):
+            tokens = tokens[1:]
+            continue
+        break
+    return tokens
+
+
+def _strip_safe_wrappers(tokens: list[str]) -> list[str]:
+    tokens = _strip_leading_env(tokens)
+    changed = True
+    while changed and tokens:
+        changed = False
+        if tokens[0] == "env":
+            new_tokens = _strip_env_command(tokens)
+            changed = new_tokens != tokens
+            tokens = _strip_leading_env(new_tokens)
+        elif tokens[0] == "timeout" and len(tokens) >= 3:
+            i = 1
+            while i < len(tokens) and tokens[i].startswith("-"):
+                i += 2 if tokens[i] in ("-k", "--kill-after", "-s", "--signal") and i + 1 < len(tokens) else 1
+            if i < len(tokens):
+                i += 1
+            tokens = _strip_leading_env(tokens[i:])
+            changed = True
+        elif tokens[0] == "nice" and len(tokens) >= 2:
+            i = 1
+            if i < len(tokens) and tokens[i] == "-n" and i + 1 < len(tokens):
+                i += 2
+            elif i < len(tokens) and re.match(r"^-\d+$", tokens[i]):
+                i += 1
+            tokens = _strip_leading_env(tokens[i:])
+            changed = True
+        elif tokens[0] in ("nohup", "time") and len(tokens) >= 2:
+            tokens = _strip_leading_env(tokens[1:])
+            changed = True
+    return tokens
+
+
 def _split_command_parts(command: str) -> list[str]:
-    parts = re.split(r"\|\||&&|[|;]", command or "")
+    command = command or ""
+    parts: list[str] = []
+    buf: list[str] = []
+    quote: str | None = None
+    escaped = False
+    i = 0
+    while i < len(command):
+        ch = command[i]
+        if escaped:
+            buf.append(ch)
+            escaped = False
+            i += 1
+            continue
+        if ch == "\\":
+            buf.append(ch)
+            escaped = True
+            i += 1
+            continue
+        if quote:
+            buf.append(ch)
+            if ch == quote:
+                quote = None
+            i += 1
+            continue
+        if ch in ("'", '"'):
+            quote = ch
+            buf.append(ch)
+            i += 1
+            continue
+        if command.startswith("&&", i) or command.startswith("||", i):
+            part = "".join(buf).strip()
+            if part:
+                parts.append(part)
+            buf = []
+            i += 2
+            continue
+        if ch in "|;":
+            part = "".join(buf).strip()
+            if part:
+                parts.append(part)
+            buf = []
+            i += 1
+            continue
+        buf.append(ch)
+        i += 1
+    part = "".join(buf).strip()
+    if part:
+        parts.append(part)
     return [p.strip() for p in parts if p.strip()]
 
 
 def _base_command(part: str) -> str:
-    for tok in part.strip().split():
-        if _ENV_VAR_RE.match(tok):
-            continue
+    for tok in _strip_safe_wrappers(_tokens(part)):
         return os.path.basename(tok)
     return ""
 

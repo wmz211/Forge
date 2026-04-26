@@ -16,8 +16,12 @@ from tool import Tool
 from tools import build_builtin_tools, build_builtin_tools_async, core_tools_for_api
 from tools.ask_user_question_tool import AskUserQuestionTool
 from tools.bash_tool import BashTool
+import tools.file_edit_tool as file_edit_module
+from tools.file_edit_tool import FileEditTool
 from tools.file_read_tool import FileReadTool, MAX_SIZE_BYTES
+from tools.file_write_tool import FileWriteTool
 from tools.notebook_edit_tool import NotebookEditTool
+from tools.powershell_tool import PowerShellTool
 from tools.task_tools import TaskOutputTool
 from tools.todo_write_tool import TodoWriteTool
 from tools.agent_tool import _resolve_tools
@@ -65,6 +69,98 @@ class PermissionFidelityTests(unittest.TestCase):
             )
             self.assertEqual(result["behavior"], "allow")
 
+    def test_bash_read_only_detection_ignores_operators_inside_quotes(self):
+        command = 'cat "semi;pipe|file.txt"'
+        self.assertTrue(BashTool().is_read_only({"command": command}))
+        result = check_permission(
+            "Bash",
+            "plan",
+            {"command": command, "_cwd": os.getcwd()},
+        )
+        self.assertEqual(result["behavior"], "allow")
+
+    def test_bash_read_only_detection_still_splits_real_compound_commands(self):
+        command = 'cat "safe.txt" && rm dangerous.txt'
+        self.assertFalse(BashTool().is_read_only({"command": command}))
+        result = check_permission(
+            "Bash",
+            "plan",
+            {"command": command, "_cwd": os.getcwd()},
+        )
+        self.assertEqual(result["behavior"], "ask")
+
+    def test_bash_read_only_detection_strips_safe_wrappers(self):
+        for command in (
+            "env FOO=bar cat file.txt",
+            "timeout 5 cat file.txt",
+            "nice -n 5 cat file.txt",
+            "nohup cat file.txt",
+        ):
+            with self.subTest(command=command):
+                self.assertTrue(BashTool().is_read_only({"command": command}))
+                result = check_permission(
+                    "Bash",
+                    "plan",
+                    {"command": command, "_cwd": os.getcwd()},
+                )
+                self.assertEqual(result["behavior"], "allow")
+
+        self.assertFalse(BashTool().is_read_only({"command": "nice rm dangerous.txt"}))
+
+    def test_bash_validation_runs_before_permission_prompt(self):
+        def fail_confirm(*args):
+            raise AssertionError("permission prompt should not run for invalid input")
+
+        ctx = ToolContext(cwd=os.getcwd(), permission_mode="default", confirm_fn=fail_confirm)
+
+        _, sleep_result = run(_run_tool({
+            "id": "bash_sleep",
+            "name": "Bash",
+            "arguments": {"command": "sleep 5"},
+        }, {"Bash": BashTool()}, ctx))
+        self.assertIn("Blocked: standalone sleep 5", sleep_result)
+
+        _, device_result = run(_run_tool({
+            "id": "bash_device",
+            "name": "Bash",
+            "arguments": {"command": "cat /dev/zero"},
+        }, {"Bash": BashTool()}, ctx))
+        self.assertIn("potentially blocking device file", device_result)
+
+    def test_bash_validation_allows_short_sleep(self):
+        ctx = ToolContext(cwd=os.getcwd(), permission_mode="default", confirm_fn=lambda *args: True)
+        valid, message = run(BashTool().validate_input({"command": "sleep 1"}, ctx))
+        self.assertTrue(valid)
+        self.assertIsNone(message)
+
+    def test_powershell_validation_blocks_foreground_sleep_before_permission_prompt(self):
+        def fail_confirm(*args):
+            raise AssertionError("permission prompt should not run for invalid input")
+
+        ctx = ToolContext(cwd=os.getcwd(), permission_mode="default", confirm_fn=fail_confirm)
+
+        _, result = run(_run_tool({
+            "id": "ps_sleep",
+            "name": "PowerShell",
+            "arguments": {"command": "Start-Sleep -Seconds 5"},
+        }, {"PowerShell": PowerShellTool()}, ctx))
+        self.assertIn("Blocked: standalone Start-Sleep 5", result)
+
+    def test_powershell_validation_allows_background_and_short_sleep(self):
+        ctx = ToolContext(cwd=os.getcwd(), permission_mode="default", confirm_fn=lambda *args: True)
+        tool = PowerShellTool()
+
+        valid, message = run(tool.validate_input({"command": "sleep 1"}, ctx))
+        self.assertTrue(valid)
+        self.assertIsNone(message)
+
+        valid, message = run(tool.validate_input({
+            "command": "Start-Sleep 5",
+            "run_in_background": True,
+        }, ctx))
+        self.assertTrue(valid)
+        self.assertIsNone(message)
+
 
 class FileReadFidelityTests(unittest.TestCase):
     def test_large_file_window_read_is_allowed_when_offset_limit_present(self):
@@ -80,6 +176,209 @@ class FileReadFidelityTests(unittest.TestCase):
             self.assertIn("3\t", output)
             self.assertIn("4\t", output)
             self.assertIn("[Showing lines 3-4", output)
+
+    def test_read_cache_stores_raw_content_not_numbered_display(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "sample.txt"
+            path.write_text("alpha\nbeta\n", encoding="utf-8")
+            ctx = ToolContext(cwd=tmp, permission_mode="default", confirm_fn=lambda *args: True)
+
+            output = run(FileReadTool().call({"file_path": str(path)}, ctx))
+            cached = ctx.file_state_cache.get(str(path))
+
+            self.assertIn("1\talpha", output)
+            self.assertIsNotNone(cached)
+            self.assertEqual(cached.content, "alpha\nbeta\n")
+
+
+class FileEditFidelityTests(unittest.TestCase):
+    def test_edit_rejects_partial_view_and_refreshes_cache_after_success(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "sample.txt"
+            path.write_text("alpha\nbeta\ngamma\n", encoding="utf-8")
+            ctx = ToolContext(cwd=tmp, permission_mode="default", confirm_fn=lambda *args: True)
+
+            run(FileReadTool().call({"file_path": str(path), "limit": 1}, ctx))
+            result = run(FileEditTool().call({
+                "file_path": str(path),
+                "old_string": "alpha",
+                "new_string": "ALPHA",
+            }, ctx))
+            self.assertIn("fully read", result)
+
+            run(FileReadTool().call({"file_path": str(path)}, ctx))
+            result = run(FileEditTool().call({
+                "file_path": str(path),
+                "old_string": "alpha",
+                "new_string": "ALPHA",
+            }, ctx))
+            self.assertIn("Edit applied", result)
+            cached = ctx.file_state_cache.get(str(path))
+            self.assertIsNotNone(cached)
+            self.assertEqual(cached.content, "ALPHA\nbeta\ngamma\n")
+
+    def test_write_refreshes_read_cache(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "created.txt"
+            ctx = ToolContext(cwd=tmp, permission_mode="default", confirm_fn=lambda *args: True)
+
+            result = run(FileWriteTool().call({"file_path": str(path), "content": "fresh\n"}, ctx))
+            cached = ctx.file_state_cache.get(str(path))
+
+            self.assertIn("Written", result)
+            self.assertIsNotNone(cached)
+            self.assertEqual(cached.content, "fresh\n")
+
+    def test_write_existing_file_requires_prior_full_read(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "existing.txt"
+            path.write_text("old\n", encoding="utf-8")
+            ctx = ToolContext(cwd=tmp, permission_mode="default", confirm_fn=lambda *args: True)
+
+            result = run(FileWriteTool().call({"file_path": str(path), "content": "new\n"}, ctx))
+            self.assertIn("has not been read", result)
+            self.assertEqual(path.read_text(encoding="utf-8"), "old\n")
+
+            run(FileReadTool().call({"file_path": str(path)}, ctx))
+            result = run(FileWriteTool().call({"file_path": str(path), "content": "new\n"}, ctx))
+            self.assertIn("Written", result)
+            self.assertEqual(path.read_text(encoding="utf-8"), "new\n")
+
+    def test_edit_empty_old_string_creates_new_file_and_fills_empty_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ctx = ToolContext(cwd=tmp, permission_mode="default", confirm_fn=lambda *args: True)
+            new_path = Path(tmp) / "new.txt"
+
+            result = run(FileEditTool().call({
+                "file_path": str(new_path),
+                "old_string": "",
+                "new_string": "hello\n",
+            }, ctx))
+            self.assertIn("Created", result)
+            self.assertEqual(new_path.read_text(encoding="utf-8"), "hello\n")
+            self.assertEqual(ctx.file_state_cache.get(str(new_path)).content, "hello\n")
+
+            empty_path = Path(tmp) / "empty.txt"
+            empty_path.write_text("", encoding="utf-8")
+            result = run(FileEditTool().call({
+                "file_path": str(empty_path),
+                "old_string": "",
+                "new_string": "filled\n",
+            }, ctx))
+            self.assertIn("Edit applied", result)
+            self.assertEqual(empty_path.read_text(encoding="utf-8"), "filled\n")
+
+    def test_edit_empty_old_string_rejects_existing_non_empty_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "existing.txt"
+            path.write_text("content\n", encoding="utf-8")
+            ctx = ToolContext(cwd=tmp, permission_mode="default", confirm_fn=lambda *args: True)
+
+            result = run(FileEditTool().call({
+                "file_path": str(path),
+                "old_string": "",
+                "new_string": "replacement\n",
+            }, ctx))
+
+            self.assertIn("already exists", result)
+            self.assertEqual(path.read_text(encoding="utf-8"), "content\n")
+
+    def test_edit_preserves_curly_quote_style_when_match_was_normalized(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "quotes.txt"
+            path.write_text(f"title = {chr(0x201c)}Old Name{chr(0x201d)}\n", encoding="utf-8")
+            ctx = ToolContext(cwd=tmp, permission_mode="default", confirm_fn=lambda *args: True)
+            run(FileReadTool().call({"file_path": str(path)}, ctx))
+
+            result = run(FileEditTool().call({
+                "file_path": str(path),
+                "old_string": 'title = "Old Name"',
+                "new_string": 'title = "New Name"',
+            }, ctx))
+
+            self.assertIn("Edit applied", result)
+            self.assertEqual(
+                path.read_text(encoding="utf-8"),
+                f"title = {chr(0x201c)}New Name{chr(0x201d)}\n",
+            )
+
+    def test_edit_and_write_validation_run_before_permission_prompt(self):
+        def fail_confirm(*args):
+            raise AssertionError("permission prompt should not run for invalid input")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "existing.txt"
+            path.write_text("content\n", encoding="utf-8")
+            ctx = ToolContext(cwd=tmp, permission_mode="default", confirm_fn=fail_confirm)
+
+            _, edit_result = run(_run_tool({
+                "id": "edit1",
+                "name": "Edit",
+                "arguments": {
+                    "file_path": str(path),
+                    "old_string": "content",
+                    "new_string": "changed",
+                },
+            }, {"Edit": FileEditTool()}, ctx))
+            self.assertIn("File has not been read yet", edit_result)
+
+            _, write_result = run(_run_tool({
+                "id": "write1",
+                "name": "Write",
+                "arguments": {
+                    "file_path": str(path),
+                    "content": "changed\n",
+                },
+            }, {"Write": FileWriteTool()}, ctx))
+            self.assertIn("File has not been read yet", write_result)
+
+    def test_edit_validation_rejects_identical_strings_and_notebooks(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ctx = ToolContext(cwd=tmp, permission_mode="default", confirm_fn=lambda *args: True)
+            edit = FileEditTool()
+
+            valid, message = run(edit.validate_input({
+                "file_path": str(Path(tmp) / "x.txt"),
+                "old_string": "same",
+                "new_string": "same",
+            }, ctx))
+            self.assertFalse(valid)
+            self.assertIn("No changes", message)
+
+            valid, message = run(edit.validate_input({
+                "file_path": str(Path(tmp) / "notebook.ipynb"),
+                "old_string": "a",
+                "new_string": "b",
+            }, ctx))
+            self.assertFalse(valid)
+            self.assertIn("NotebookEdit", message)
+
+    def test_edit_rejects_files_over_max_edit_size_before_reading(self):
+        old_limit = file_edit_module.MAX_EDIT_FILE_SIZE
+        try:
+            file_edit_module.MAX_EDIT_FILE_SIZE = 8
+            with tempfile.TemporaryDirectory() as tmp:
+                path = Path(tmp) / "large.txt"
+                path.write_text("0123456789\n", encoding="utf-8")
+                ctx = ToolContext(cwd=tmp, permission_mode="default", confirm_fn=lambda *args: True)
+                edit = FileEditTool()
+
+                valid, message = run(edit.validate_input({
+                    "file_path": str(path),
+                    "old_string": "0",
+                    "new_string": "1",
+                }, ctx))
+                self.assertFalse(valid)
+                self.assertIn("too large to edit", message)
+
+                result = run(edit.call({
+                    "file_path": str(path),
+                    "old_string": "",
+                    "new_string": "new\n",
+                }, ctx))
+                self.assertIn("too large to edit", result)
+        finally:
+            file_edit_module.MAX_EDIT_FILE_SIZE = old_limit
 
 
 class TodoWriteFidelityTests(unittest.TestCase):
