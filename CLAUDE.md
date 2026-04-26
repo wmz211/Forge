@@ -38,7 +38,7 @@ Deduplication by resolved path. `get_memory_file_entries(cwd)` returns entries f
 ## Build & Run
 ```bash
 pip install -r requirements.txt
-export CODING_AGENT_API_KEY=<your-dashscope-key>
+export FORGE_API_KEY=<your-dashscope-key>
 python main.py [--cwd PATH] [--mode default|plan|acceptEdits|bypassPermissions]
 ```
 

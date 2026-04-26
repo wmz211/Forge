@@ -22,11 +22,20 @@ from .task_tools import (
     TaskOutputTool,
 )
 from .mcp_tool import McpTool
+from .enter_plan_mode_tool import EnterPlanModeTool
+from .exit_plan_mode_tool import ExitPlanModeTool
+from .enter_worktree_tool import EnterWorktreeTool
+from .exit_worktree_tool import ExitWorktreeTool
+from .cron_tools import CronCreateTool, CronDeleteTool, CronListTool
+from .remote_trigger_tool import RemoteTriggerTool
+from .send_message_tool import SendMessageTool
+from .schedule_wakeup_tool import ScheduleWakeupTool
+from .monitor_tool import MonitorTool
 from services.mcp import discover_mcp_tools
 
 
 def _build_static_tools() -> list:
-    return [
+    tools = [
         BashTool(),
         FileReadTool(),
         FileEditTool(),
@@ -47,7 +56,26 @@ def _build_static_tools() -> list:
         TaskListTool(),
         TaskStopTool(),
         TaskOutputTool(),
+        # Plan mode tools (deferred).
+        EnterPlanModeTool(),
+        ExitPlanModeTool(),
+        # Worktree tools (deferred).
+        EnterWorktreeTool(),
+        ExitWorktreeTool(),
+        # Scheduling tools (deferred, feature-gated via is_enabled()).
+        CronCreateTool(),
+        CronDeleteTool(),
+        CronListTool(),
+        RemoteTriggerTool(),
+        ScheduleWakeupTool(),
+        # Agent swarm tools (deferred, feature-gated).
+        SendMessageTool(),
+        # Monitoring (deferred, feature-gated).
+        MonitorTool(),
     ]
+    # Filter out tools whose is_enabled() returns False so they don't clutter
+    # the ToolSearch index when the feature gate is off.
+    return [t for t in tools if getattr(t, "is_enabled", lambda: True)()]
 
 
 async def build_mcp_tools(cwd: str | None) -> list:
@@ -123,6 +151,17 @@ __all__ = [
     "TaskStopTool",
     "TaskOutputTool",
     "McpTool",
+    "EnterPlanModeTool",
+    "ExitPlanModeTool",
+    "EnterWorktreeTool",
+    "ExitWorktreeTool",
+    "CronCreateTool",
+    "CronDeleteTool",
+    "CronListTool",
+    "RemoteTriggerTool",
+    "SendMessageTool",
+    "ScheduleWakeupTool",
+    "MonitorTool",
     "build_mcp_tools",
     "build_builtin_tools_async",
     "build_builtin_tools",

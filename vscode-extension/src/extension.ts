@@ -82,7 +82,7 @@ async function startServer(outputChannel: vscode.OutputChannel): Promise<boolean
     setStatus("$(sync~spin) CodingAgent", "Starting server…");
 
     const env: NodeJS.ProcessEnv = { ...process.env };
-    if (cfg.apiKey) { env["CODING_AGENT_API_KEY"] = cfg.apiKey; }
+    if (cfg.apiKey) { env["FORGE_API_KEY"] = cfg.apiKey; }
 
     serverProcess = cp.spawn(cfg.python, [
         serverScript,

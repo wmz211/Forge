@@ -4,6 +4,11 @@
   "description": "AI coding assistant powered by Qwen — local ReAct agent with file/shell tools",
   "version": "0.1.0",
   "publisher": "coding-agent",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/wmz211/Forge.git"
+  },
   "engines": { "vscode": "^1.85.0" },
   "categories": ["AI", "Other"],
   "activationEvents": [],

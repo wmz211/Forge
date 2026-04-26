@@ -244,6 +244,39 @@ async def _run_tool(
     return tc["id"], result
 
 
+def _yield_missing_tool_result_blocks(
+    assistant_messages: list[dict],
+    error_message: str,
+) -> list[dict]:
+    """
+    Synthesize tool_result error blocks for any tool_use blocks in assistant_messages
+    that have no corresponding tool_result. Called when an error interrupts tool
+    execution mid-stream.
+
+    Mirrors yieldMissingToolResultBlocks() in query.ts — the generator yields
+    createUserMessage({ content: [{ type: 'tool_result', is_error: true, ... }] })
+    for each orphaned tool_use block. We return a list of message dicts instead
+    of yielding, so the caller can both append them to history and yield events.
+    """
+    result_messages = []
+    for asst_msg in assistant_messages:
+        content = asst_msg.get("tool_calls") or []
+        for tc in content:
+            tc_id = tc.get("id") or tc.get("tool_call_id", "")
+            result_messages.append({
+                "role": "user",
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": tc_id,
+                        "content": error_message,
+                        "is_error": True,
+                    }
+                ],
+            })
+    return result_messages
+
+
 def _append_hook_context(result: str, tool_name: str, event: str, hook_result: dict | None) -> str:
     if not hook_result or not hook_result.get("additional_context"):
         return result
@@ -314,6 +347,11 @@ async def query_loop(
 
     while turn < max_turns:
         turn += 1
+
+        # Mirrors: yield { type: 'stream_request_start' } in query.ts queryLoop.
+        # Signals to callers (e.g. UI layer, IDE server) that a new API request
+        # is about to be sent so they can show a "thinking" indicator.
+        yield {"type": "stream_request_start"}
 
         # ── Compaction pipeline (mirrors queryLoop in query.ts) ──────────────
         #
@@ -386,29 +424,52 @@ async def query_loop(
         # ── Call Qwen API (streaming) ─────────────────────────────────────────
         text_buffer = ""
         tool_calls_this_turn: list[dict] = []
+        assistant_messages_this_turn: list[dict] = []
         stop_reason = "stop"
 
-        async for event in api_client.stream(
-            messages=api_messages,
-            tools=openai_tools,
-            system_prompt=system_prompt,
-        ):
-            if event["type"] == "text":
-                text_buffer += event["content"]
-                yield {"type": "text", "content": event["content"]}
+        try:
+            async for event in api_client.stream(
+                messages=api_messages,
+                tools=openai_tools,
+                system_prompt=system_prompt,
+            ):
+                if event["type"] == "text":
+                    text_buffer += event["content"]
+                    yield {"type": "text", "content": event["content"]}
 
-            elif event["type"] == "tool_call":
-                tool_calls_this_turn.append(event)
-                yield {
-                    "type": "tool_use",
-                    "name": event["name"],
-                    "arguments": event["arguments"],
-                    "id": event["id"],
-                }
+                elif event["type"] == "tool_call":
+                    tool_calls_this_turn.append(event)
+                    yield {
+                        "type": "tool_use",
+                        "name": event["name"],
+                        "arguments": event["arguments"],
+                        "id": event["id"],
+                    }
 
-            elif event["type"] == "done":
-                stop_reason = event["stop_reason"]
-                current_usage = event.get("usage")
+                elif event["type"] == "done":
+                    stop_reason = event["stop_reason"]
+                    current_usage = event.get("usage")
+
+        except Exception as api_error:
+            # Mirrors the catch block in query.ts queryLoop: if an error occurs
+            # mid-stream after tool_use blocks have been emitted, we must synthesize
+            # tool_result error blocks for each orphaned tool_use — otherwise the
+            # message history will be malformed (tool_use without tool_result).
+            error_text = str(api_error)
+            if tool_calls_this_turn and not assistant_messages_this_turn:
+                assistant_messages_this_turn.append({
+                    "role": "assistant",
+                    "content": text_buffer,
+                    "tool_calls": tool_calls_this_turn,
+                })
+            for missing_msg in _yield_missing_tool_result_blocks(
+                assistant_messages_this_turn, error_text
+            ):
+                current_messages.append(missing_msg)
+                yield {"type": "tool_result_message", "message": missing_msg}
+            yield {"type": "error", "message": error_text}
+            yield {"type": "done", "reason": "model_error", "usage": current_usage}
+            return
 
         # ── Max-output-tokens recovery (mirrors query.ts:1223) ────────────────
         # When the API hits MAX_OUTPUT_TOKENS (finish_reason="length"), we have a
@@ -465,6 +526,7 @@ async def query_loop(
             # Mirrors the timestamps stored on AssistantMessage in the source.
             asst_msg["_timestamp"] = time.time()
             current_messages.append(asst_msg)
+            assistant_messages_this_turn.append(asst_msg)
             yield {"type": "assistant_message", "message": asst_msg}
 
         # ④ No tool calls → check Stop hooks, then done
