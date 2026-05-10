@@ -9,6 +9,7 @@ from typing import Any
 
 
 MCP_PROTOCOL_VERSION = "2024-11-05"
+MCP_REQUEST_TIMEOUT_SECONDS = float(os.environ.get("FORGE_MCP_REQUEST_TIMEOUT_SECONDS", "30"))
 
 
 @dataclass(frozen=True)
@@ -89,6 +90,7 @@ class McpStdioClient:
         self.config = config
         self._proc: asyncio.subprocess.Process | None = None
         self._next_id = 1
+        self._stderr_task: asyncio.Task | None = None
 
     async def initialize(self) -> dict[str, Any]:
         result = await self.request(
@@ -127,20 +129,24 @@ class McpStdioClient:
         }
         self._proc.stdin.write((json.dumps(message) + "\n").encode("utf-8"))
         await self._proc.stdin.drain()
-        while True:
-            line = await self._proc.stdout.readline()
-            if not line:
-                raise RuntimeError(f"MCP server {self.config.name} exited before replying to {method}")
-            payload = json.loads(line.decode("utf-8"))
-            if payload.get("id") != request_id:
-                continue
-            if "error" in payload:
-                error = payload["error"]
-                if isinstance(error, dict):
-                    raise RuntimeError(str(error.get("message") or error))
-                raise RuntimeError(str(error))
-            result = payload.get("result")
-            return result if isinstance(result, dict) else {}
+        try:
+            while True:
+                line = await self._read_stdout_line(method)
+                if not line:
+                    raise RuntimeError(f"MCP server {self.config.name} exited before replying to {method}")
+                payload = json.loads(line.decode("utf-8"))
+                if payload.get("id") != request_id:
+                    continue
+                if "error" in payload:
+                    error = payload["error"]
+                    if isinstance(error, dict):
+                        raise RuntimeError(str(error.get("message") or error))
+                    raise RuntimeError(str(error))
+                result = payload.get("result")
+                return result if isinstance(result, dict) else {}
+        except Exception:
+            await self.close()
+            raise
 
     async def notify(self, method: str, params: dict[str, Any] | None = None) -> None:
         await self._ensure_started()
@@ -151,7 +157,9 @@ class McpStdioClient:
 
     async def close(self) -> None:
         proc = self._proc
+        stderr_task = self._stderr_task
         self._proc = None
+        self._stderr_task = None
         if proc is None:
             return
         if proc.stdin:
@@ -165,6 +173,12 @@ class McpStdioClient:
         except asyncio.TimeoutError:
             proc.kill()
             await proc.wait()
+        if stderr_task is not None:
+            stderr_task.cancel()
+            try:
+                await stderr_task
+            except asyncio.CancelledError:
+                pass
 
     async def _ensure_started(self) -> None:
         if self._proc is not None:
@@ -180,6 +194,29 @@ class McpStdioClient:
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
+        if self._proc.stderr is not None:
+            self._stderr_task = asyncio.create_task(self._drain_stderr())
+
+    async def _read_stdout_line(self, method: str) -> bytes:
+        assert self._proc and self._proc.stdout
+        try:
+            return await asyncio.wait_for(
+                self._proc.stdout.readline(),
+                timeout=MCP_REQUEST_TIMEOUT_SECONDS,
+            )
+        except asyncio.TimeoutError as exc:
+            raise RuntimeError(
+                f"MCP server {self.config.name} timed out replying to {method}"
+            ) from exc
+
+    async def _drain_stderr(self) -> None:
+        proc = self._proc
+        if proc is None or proc.stderr is None:
+            return
+        while True:
+            chunk = await proc.stderr.read(4096)
+            if not chunk:
+                return
 
 
 def format_mcp_tool_result(result: dict[str, Any]) -> str:

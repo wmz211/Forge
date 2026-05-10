@@ -3,7 +3,7 @@ import asyncio
 import time
 from typing import AsyncGenerator, Any, Callable
 
-from tool import Tool, ToolContext
+from tool import Tool, ToolContext, validate_tool_input_schema
 from services.compact import (
     compact,
     calculate_token_warning_state,
@@ -76,11 +76,11 @@ def _partition_tool_calls(
             safe = False
         else:
             args = tc.get("arguments")
-            safe = bool(
-                tool.is_concurrency_safe_for_input(args)
-                if isinstance(args, dict)
-                else tool.is_concurrency_safe_for_input({})
-            )
+            if not isinstance(args, dict):
+                safe = False
+            else:
+                schema_ok, _ = validate_tool_input_schema(tool, args)
+                safe = bool(schema_ok and tool.is_concurrency_safe_for_input(args))
         if safe and batches and batches[-1][0]:
             batches[-1][1].append(tc)
         else:
@@ -101,6 +101,24 @@ async def _run_tool(
     tool_input = tc["arguments"] if isinstance(tc.get("arguments"), dict) else {}
 
     desc = f"{tc['name']}({tc['arguments']})"
+    schema_ok, schema_message = validate_tool_input_schema(tool, tool_input)
+    if not schema_ok:
+        error = schema_message or "Invalid tool input"
+        failure_hook = await execute_post_tool_use_failure_hooks(
+            tool_name=tc["name"],
+            tool_input=tool_input,
+            error=error,
+            cwd=ctx.cwd,
+            session_id=ctx.session_id,
+            transcript_path=str(ctx.session_transcript_path),
+            permission_mode=ctx.permission_mode,
+        )
+        return tc["id"], _append_hook_context(
+            f"<error>{error}</error>",
+            tc["name"],
+            "PostToolUseFailure",
+            failure_hook,
+        )
     try:
         ok, validation_message = await tool.validate_input(tool_input, ctx)
     except Exception as e:

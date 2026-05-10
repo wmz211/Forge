@@ -1,6 +1,6 @@
 """
-Built-in agent definitions for AgentTool.
-Mirrors src/tools/AgentTool/built-in/*.ts + builtInAgents.ts.
+Agent definitions for AgentTool.
+Mirrors src/tools/AgentTool/built-in/*.ts + loadAgentsDir.ts in a compact form.
 
 Each AgentDefinition carries:
   agent_type        — wire name used in subagent_type parameter
@@ -11,7 +11,9 @@ Each AgentDefinition carries:
   model             — None = inherit parent model
 """
 from __future__ import annotations
-from dataclasses import dataclass, field
+import re
+from dataclasses import dataclass
+from pathlib import Path
 from typing import Callable
 
 # ── Canonical tool names (mirrors */toolName.ts / */prompt.ts constants) ─────
@@ -46,6 +48,11 @@ class AgentDefinition:
     disallowed_tools: list[str] | None = None
     source: str = "built-in"
     model: str | None = None   # None / 'inherit' = use parent model
+    permission_mode: str | None = None
+    max_turns: int | None = None
+    background: bool = False
+    isolation: str | None = None
+    color: str | None = None
 
 
 # ── Shared prompt fragments ───────────────────────────────────────────────────
@@ -227,6 +234,30 @@ MCP configuration, and IDE integrations
 Complete the user's question thoroughly and report your findings clearly."""
 
 
+def _statusline_setup_prompt() -> str:
+    """Mirrors the narrow statusline setup built-in agent."""
+    return """\
+You configure the user's Claude Code status line setting.
+
+Read the relevant settings files, make the smallest necessary edit, and report
+what changed. Do not modify unrelated configuration."""
+
+
+def _verification_prompt() -> str:
+    """Mirrors the verification agent's role at a practical fidelity level."""
+    return """\
+You are a verification agent. Your job is to independently verify that an
+implementation is correct before the main agent reports completion.
+
+Run the most relevant tests, builds, linters, and focused inspections available
+for the changed files. Return a concise verdict:
+- PASS when evidence supports correctness
+- FAIL when you found a concrete problem
+- PARTIAL when verification was limited
+
+Include the exact commands or checks performed and the important evidence."""
+
+
 # ── Built-in agent registry ───────────────────────────────────────────────────
 
 GENERAL_PURPOSE_AGENT = AgentDefinition(
@@ -296,11 +327,40 @@ CLAUDE_CODE_GUIDE_AGENT = AgentDefinition(
     model=None,
 )
 
+STATUSLINE_SETUP_AGENT = AgentDefinition(
+    agent_type="statusline-setup",
+    when_to_use="Use this agent to configure the user's Claude Code status line setting.",
+    get_system_prompt=_statusline_setup_prompt,
+    tools=[READ_TOOL_NAME, EDIT_TOOL_NAME],
+    model="sonnet",
+    color="orange",
+)
+
+VERIFICATION_AGENT = AgentDefinition(
+    agent_type="verification",
+    when_to_use=(
+        "Use this agent to verify that implementation work is correct before "
+        "reporting completion. Invoke after non-trivial tasks (3+ file edits, "
+        "backend/API changes, infrastructure changes). Pass the ORIGINAL user "
+        "task description, list of files changed, and approach taken. The agent "
+        "runs builds, tests, linters, and checks to produce a PASS/FAIL/PARTIAL "
+        "verdict with evidence."
+    ),
+    get_system_prompt=_verification_prompt,
+    tools=None,
+    disallowed_tools=[AGENT_TOOL_NAME],
+    model="inherit",
+    background=True,
+    color="red",
+)
+
 _BUILT_IN_AGENTS: list[AgentDefinition] = [
     GENERAL_PURPOSE_AGENT,
+    STATUSLINE_SETUP_AGENT,
     EXPLORE_AGENT,
     PLAN_AGENT,
     CLAUDE_CODE_GUIDE_AGENT,
+    VERIFICATION_AGENT,
 ]
 
 
@@ -309,8 +369,102 @@ def get_built_in_agents() -> list[AgentDefinition]:
     return list(_BUILT_IN_AGENTS)
 
 
-def get_agent_by_type(agent_type: str) -> AgentDefinition | None:
-    for agent in _BUILT_IN_AGENTS:
+def _parse_bool(value: str | None) -> bool:
+    return str(value or "").strip().lower() in ("1", "true", "yes")
+
+
+def _parse_list(value: str | None) -> list[str] | None:
+    if value is None:
+        return None
+    text = value.strip()
+    if not text:
+        return []
+    if text == "*":
+        return None
+    if text.startswith("[") and text.endswith("]"):
+        text = text[1:-1]
+    return [item.strip().strip("'\"") for item in text.split(",") if item.strip()]
+
+
+def _split_frontmatter(text: str) -> tuple[dict[str, str], str]:
+    if not text.startswith("---"):
+        return {}, text.strip()
+    match = re.match(r"^---\s*\n(.*?)\n---\s*\n?(.*)$", text, flags=re.S)
+    if not match:
+        return {}, text.strip()
+    data: dict[str, str] = {}
+    for line in match.group(1).splitlines():
+        if not line.strip() or line.lstrip().startswith("#") or ":" not in line:
+            continue
+        key, value = line.split(":", 1)
+        data[key.strip()] = value.strip().strip("'\"")
+    return data, match.group(2).strip()
+
+
+def _agent_dirs(cwd: str) -> list[tuple[Path, str]]:
+    dirs: list[tuple[Path, str]] = []
+    home_agents = Path.home() / ".claude" / "agents"
+    dirs.append((home_agents, "userSettings"))
+    current = Path(cwd).resolve()
+    home = Path.home().resolve()
+    project_dirs: list[Path] = []
+    for parent in [current, *current.parents]:
+        project_dirs.append(parent / ".claude" / "agents")
+        if parent == home:
+            break
+    for directory in reversed(project_dirs):
+        dirs.append((directory, "projectSettings"))
+    return dirs
+
+
+def _load_custom_agents(cwd: str | None) -> list[AgentDefinition]:
+    if not cwd:
+        return []
+    agents: list[AgentDefinition] = []
+    for directory, source in _agent_dirs(cwd):
+        if not directory.exists():
+            continue
+        for path in sorted(directory.glob("*.md")):
+            try:
+                frontmatter, body = _split_frontmatter(path.read_text(encoding="utf-8"))
+            except OSError:
+                continue
+            name = frontmatter.get("name")
+            description = frontmatter.get("description")
+            if not name or not description or not body:
+                continue
+            prompt = body
+            agents.append(AgentDefinition(
+                agent_type=name,
+                when_to_use=description.replace("\\n", "\n"),
+                get_system_prompt=lambda prompt=prompt: prompt,
+                tools=_parse_list(frontmatter.get("tools")),
+                disallowed_tools=_parse_list(frontmatter.get("disallowedTools")),
+                source=source,
+                model=frontmatter.get("model") or None,
+                permission_mode=frontmatter.get("permissionMode") or None,
+                max_turns=int(frontmatter["maxTurns"]) if frontmatter.get("maxTurns", "").isdigit() else None,
+                background=_parse_bool(frontmatter.get("background")),
+                isolation=frontmatter.get("isolation") or None,
+                color=frontmatter.get("color") or None,
+            ))
+    return agents
+
+
+def get_active_agents(cwd: str | None = None) -> list[AgentDefinition]:
+    """
+    Return built-in agents plus user/project custom agents.
+    Later custom agents with the same type override earlier definitions,
+    mirroring Claude Code's active-agent merge behavior.
+    """
+    merged: dict[str, AgentDefinition] = {}
+    for agent in [*get_built_in_agents(), *_load_custom_agents(cwd)]:
+        merged[agent.agent_type] = agent
+    return list(merged.values())
+
+
+def get_agent_by_type(agent_type: str, cwd: str | None = None) -> AgentDefinition | None:
+    for agent in get_active_agents(cwd):
         if agent.agent_type == agent_type:
             return agent
     return None

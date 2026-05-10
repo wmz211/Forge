@@ -7,7 +7,6 @@ Usage:
 """
 from __future__ import annotations
 import argparse
-import asyncio
 import json
 import os
 import sys
@@ -16,9 +15,9 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent))
 
 try:
-    from fastapi import FastAPI, Request
+    from fastapi import FastAPI
     from fastapi.middleware.cors import CORSMiddleware
-    from fastapi.responses import StreamingResponse, JSONResponse
+    from fastapi.responses import StreamingResponse
     import uvicorn
 except ImportError:
     print("ERROR: fastapi and uvicorn are required for the server mode.")
@@ -28,17 +27,17 @@ except ImportError:
 from pydantic import BaseModel
 
 from query_engine import QueryEngine
-from tools import (
-    BashTool, FileReadTool, FileEditTool, FileWriteTool,
-    GlobTool, GrepTool, WebFetchTool, WebSearchTool, AgentTool,
-)
+from tools import AgentTool, build_builtin_tools_async
 from services.api import QwenClient
-from query import DEFAULT_SYSTEM_PROMPT
+from permissions import PERMISSION_MODES
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
 API_KEY = os.environ.get("FORGE_API_KEY")
 MODEL   = os.environ.get("FORGE_MODEL", "qwen3-coder-plus")
+SERVER_PERMISSION_MODE = os.environ.get("FORGE_SERVER_PERMISSION_MODE", "dontAsk")
+if SERVER_PERMISSION_MODE not in PERMISSION_MODES:
+    SERVER_PERMISSION_MODE = "dontAsk"
 
 # ── App ───────────────────────────────────────────────────────────────────────
 
@@ -54,35 +53,26 @@ app.add_middleware(
 _engine: QueryEngine | None = None
 
 
-def _get_engine(cwd: str) -> QueryEngine:
+async def _build_engine(cwd: str) -> QueryEngine:
+    tools = await build_builtin_tools_async(cwd=cwd)
+    agent_api = QwenClient(api_key=API_KEY, model=MODEL)
+    agent_tool = AgentTool(all_tools=tools, api_client=agent_api, max_turns=20, cwd=cwd)
+    tools.append(agent_tool)
+    agent_tool._all_tools = tools
+    return QueryEngine(
+        api_key=API_KEY,
+        model=MODEL,
+        cwd=cwd,
+        tools=tools,
+        permission_mode=SERVER_PERMISSION_MODE,
+    )
+
+
+async def _get_engine(cwd: str) -> QueryEngine:
     global _engine
     if _engine is None or _engine.cwd != cwd:
-        tools = _build_tools(cwd)
-        agent_api = QwenClient(api_key=API_KEY, model=MODEL)
-        agent_tool = AgentTool(all_tools=tools, api_client=agent_api, max_turns=20)
-        tools.append(agent_tool)
-        agent_tool._all_tools = tools
-        _engine = QueryEngine(
-            api_key=API_KEY,
-            model=MODEL,
-            cwd=cwd,
-            tools=tools,
-            permission_mode="bypassPermissions",
-        )
+        _engine = await _build_engine(cwd)
     return _engine
-
-
-def _build_tools(cwd: str) -> list:
-    return [
-        BashTool(),
-        FileReadTool(),
-        FileEditTool(),
-        FileWriteTool(),
-        GlobTool(),
-        GrepTool(),
-        WebFetchTool(),
-        WebSearchTool(),
-    ]
 
 
 # ── Models ────────────────────────────────────────────────────────────────────
@@ -102,7 +92,7 @@ async def health():
 @app.post("/clear")
 async def clear(req: ChatRequest):
     cwd = req.cwd or os.getcwd()
-    engine = _get_engine(cwd)
+    engine = await _get_engine(cwd)
     engine.clear()
     return {"ok": True}
 
@@ -110,7 +100,7 @@ async def clear(req: ChatRequest):
 @app.post("/chat")
 async def chat(req: ChatRequest):
     cwd = req.cwd or os.getcwd()
-    engine = _get_engine(cwd)
+    engine = await _get_engine(cwd)
 
     async def event_stream():
         try:
@@ -148,12 +138,10 @@ def main():
     parser.add_argument("--cwd", default=os.getcwd())
     args = parser.parse_args()
 
-    # Pre-warm the engine
-    _get_engine(os.path.abspath(args.cwd))
-
     print(f"CodingAgent server listening on http://{args.host}:{args.port}")
     print(f"  cwd  : {args.cwd}")
     print(f"  model: {MODEL}")
+    print(f"  mode : {SERVER_PERMISSION_MODE}")
     uvicorn.run(app, host=args.host, port=args.port, log_level="warning")
 
 

@@ -539,7 +539,8 @@ class QueryEngine:
         self._messages.append(user_msg)
         self._save_message(user_msg)
 
-        # Inject hook additional_context as a system note before the user message.
+        # Inject hook additional_context as a user-scoped note and persist it so
+        # resumed sessions reconstruct the same context the live turn saw.
         # Mirrors the hook_additional_context attachment in processUserInput.ts.
         if _prompt_hook.get("additional_context"):
             _ctx_msg = {
@@ -547,6 +548,7 @@ class QueryEngine:
                 "content": f"[Hook additional context]: {_prompt_hook['additional_context']}",
             }
             self._messages.append(_ctx_msg)
+            self._save_message(_ctx_msg)
 
         # Heartbeat: signal this session is still active before each turn.
         # Mirrors writeHeartbeat() called at the start of each query in
@@ -647,8 +649,10 @@ class QueryEngine:
         # Truncate the transcript file
         if self._transcript_path.exists():
             self._transcript_path.write_text("", encoding="utf-8")
+        _write_session_header(
+            self._transcript_path,
+            self.session_id,
+            self.cwd,
+            self._model,
+        )
         print(f"[Session] Cleared {self.session_id[:8]}…")
-
-    @property
-    def transcript_path(self) -> str:
-        return str(self._transcript_path)

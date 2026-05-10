@@ -116,7 +116,7 @@ async def run(args: argparse.Namespace) -> None:
     from services.api import QwenClient
     agent_api = QwenClient(api_key=API_KEY, model=MODEL)
     # AgentTool needs the full tool pool (including itself) so sub-agents inherit all tools.
-    agent_tool = AgentTool(all_tools=tools, api_client=agent_api, max_turns=20)
+    agent_tool = AgentTool(all_tools=tools, api_client=agent_api, max_turns=20, cwd=cwd)
     tools.append(agent_tool)
     agent_tool._all_tools = tools
 

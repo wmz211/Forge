@@ -11,6 +11,8 @@ import unittest
 from pathlib import Path
 
 from permissions import check_permission
+import query_engine as query_engine_module
+from query_engine import QueryEngine
 from tool import ToolContext
 from tool import Tool
 from tools import build_builtin_tools, build_builtin_tools_async, core_tools_for_api
@@ -24,10 +26,14 @@ from tools.notebook_edit_tool import NotebookEditTool
 from tools.powershell_tool import PowerShellTool
 from tools.task_tools import TaskOutputTool
 from tools.todo_write_tool import TodoWriteTool
-from tools.agent_tool import _resolve_tools
+from tools.agent_tool import AgentTool, _resolve_tools
+from tools.agent_tool.built_in_agents import get_active_agents
 from utils.file_state_cache import FileState
 from utils.hooks import execute_pre_tool_use_hooks, execute_user_prompt_submit_hooks
 from query import _run_tool
+from query import _partition_tool_calls
+import services.mcp as mcp_module
+from services.mcp import McpServerConfig, McpStdioClient
 
 
 def run(coro):
@@ -132,6 +138,38 @@ class PermissionFidelityTests(unittest.TestCase):
         valid, message = run(BashTool().validate_input({"command": "sleep 1"}, ctx))
         self.assertTrue(valid)
         self.assertIsNone(message)
+
+    def test_tool_schema_validation_runs_before_tool_validation_and_permission(self):
+        def fail_confirm(*args):
+            raise AssertionError("permission prompt should not run for invalid schema")
+
+        ctx = ToolContext(cwd=os.getcwd(), permission_mode="default", confirm_fn=fail_confirm)
+
+        _, missing_result = run(_run_tool({
+            "id": "missing_command",
+            "name": "Bash",
+            "arguments": {},
+        }, {"Bash": BashTool()}, ctx))
+        self.assertIn("input.command is required", missing_result)
+
+        _, wrong_type_result = run(_run_tool({
+            "id": "bad_timeout",
+            "name": "Bash",
+            "arguments": {"command": "echo hi", "timeout": "slow"},
+        }, {"Bash": BashTool()}, ctx))
+        self.assertIn("input.timeout must be integer", wrong_type_result)
+
+    def test_invalid_schema_tool_calls_are_not_marked_concurrency_safe(self):
+        batches = _partition_tool_calls(
+            [
+                {"id": "bad", "name": "Read", "arguments": {}},
+                {"id": "good", "name": "Read", "arguments": {"file_path": "tool.py"}},
+            ],
+            {"Read": FileReadTool()},
+        )
+        self.assertEqual([len(batch) for _, batch in batches], [1, 1])
+        self.assertFalse(batches[0][0])
+        self.assertTrue(batches[1][0])
 
     def test_powershell_validation_blocks_foreground_sleep_before_permission_prompt(self):
         def fail_confirm(*args):
@@ -881,6 +919,114 @@ class HookFidelityTests(unittest.TestCase):
             self.assertIn("permission-denied-context", result)
 
 
+class QueryEnginePersistenceFidelityTests(unittest.TestCase):
+    class FakeStopClient:
+        async def stream(self, messages, tools=None, system_prompt=None):
+            yield {"type": "text", "content": "ok"}
+            yield {
+                "type": "done",
+                "stop_reason": "stop",
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1},
+            }
+
+    def test_user_prompt_hook_context_is_persisted_for_resume(self):
+        old_projects_dir = query_engine_module._get_projects_dir
+        with tempfile.TemporaryDirectory() as tmp:
+            query_engine_module._get_projects_dir = lambda: Path(tmp) / "projects"
+            try:
+                cwd = Path(tmp) / "workspace"
+                settings_dir = cwd / ".claude"
+                settings_dir.mkdir(parents=True)
+                command = "cmd /c echo hook-context" if os.name == "nt" else "sh -c 'echo hook-context'"
+                (settings_dir / "settings.json").write_text(json.dumps({
+                    "hooks": {
+                        "UserPromptSubmit": [
+                            {
+                                "matcher": "*",
+                                "hooks": [{"type": "command", "command": command}],
+                            }
+                        ]
+                    }
+                }), encoding="utf-8")
+
+                engine = QueryEngine(
+                    api_key="test",
+                    model="test-model",
+                    cwd=str(cwd),
+                    tools=[],
+                    session_id="persist-hook-test",
+                )
+                engine._api = self.FakeStopClient()
+                events = run(_collect(engine.submit_message("hello")))
+                self.assertEqual(events[-1]["type"], "done")
+
+                resumed = QueryEngine(
+                    api_key="test",
+                    model="test-model",
+                    cwd=str(cwd),
+                    tools=[],
+                    session_id="persist-hook-test",
+                )
+                contents = [msg.get("content", "") for msg in resumed._messages]
+                self.assertTrue(
+                    any(
+                        content.startswith("[Hook additional context]:")
+                        and "hook-context" in content
+                        for content in contents
+                    )
+                )
+            finally:
+                query_engine_module._get_projects_dir = old_projects_dir
+
+    def test_clear_restores_session_summary_header(self):
+        old_projects_dir = query_engine_module._get_projects_dir
+        with tempfile.TemporaryDirectory() as tmp:
+            query_engine_module._get_projects_dir = lambda: Path(tmp) / "projects"
+            try:
+                cwd = Path(tmp) / "workspace"
+                cwd.mkdir()
+                engine = QueryEngine(
+                    api_key="test",
+                    model="test-model",
+                    cwd=str(cwd),
+                    tools=[],
+                    session_id="clear-header-test",
+                )
+                engine._save_message({"role": "user", "content": "before clear"})
+                engine.clear()
+                entries = query_engine_module._load_jsonl(engine.transcript_path)
+                self.assertEqual(entries[0]["type"], "summary")
+                self.assertEqual(entries[0]["sessionId"], "clear-header-test")
+                self.assertFalse(any(entry.get("type") == "message" for entry in entries))
+            finally:
+                query_engine_module._get_projects_dir = old_projects_dir
+
+    def test_transcript_path_keeps_path_semantics(self):
+        old_projects_dir = query_engine_module._get_projects_dir
+        with tempfile.TemporaryDirectory() as tmp:
+            query_engine_module._get_projects_dir = lambda: Path(tmp) / "projects"
+            try:
+                cwd = Path(tmp) / "workspace"
+                cwd.mkdir()
+                engine = QueryEngine(
+                    api_key="test",
+                    model="test-model",
+                    cwd=str(cwd),
+                    tools=[],
+                    session_id="path-semantics-test",
+                )
+                self.assertIsInstance(engine.transcript_path, Path)
+            finally:
+                query_engine_module._get_projects_dir = old_projects_dir
+
+
+async def _collect(agen):
+    out = []
+    async for item in agen:
+        out.append(item)
+    return out
+
+
 class BackgroundTaskFidelityTests(unittest.TestCase):
     def test_background_bash_output_is_retrievable_by_task_output(self):
         async def scenario(tmp: str) -> dict:
@@ -907,6 +1053,48 @@ class BackgroundTaskFidelityTests(unittest.TestCase):
 
 
 class AgentToolFilteringFidelityTests(unittest.TestCase):
+    def test_builtin_agent_list_matches_current_source_surface(self):
+        names = {agent.agent_type for agent in get_active_agents(os.getcwd())}
+        self.assertIn("general-purpose", names)
+        self.assertIn("statusline-setup", names)
+        self.assertIn("Explore", names)
+        self.assertIn("Plan", names)
+        self.assertIn("claude-code-guide", names)
+        self.assertIn("verification", names)
+
+    def test_agent_prompt_allows_proactive_and_parallel_use(self):
+        tool = AgentTool(all_tools=[], api_client=None, cwd=os.getcwd())
+        prompt = tool.to_openai_tool()["function"]["description"]
+        self.assertIn("when an agent description matches the task", prompt)
+        self.assertIn("multiple Agent tool calls", prompt)
+        self.assertNotIn("Only use this tool when the user explicitly says", prompt)
+
+    def test_project_custom_agent_is_loaded_into_schema(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            agents_dir = Path(tmp) / ".claude" / "agents"
+            agents_dir.mkdir(parents=True)
+            (agents_dir / "reviewer.md").write_text(
+                "---\n"
+                "name: code-reviewer\n"
+                "description: Review risky code changes proactively\n"
+                "tools: Read, Grep\n"
+                "model: inherit\n"
+                "background: true\n"
+                "maxTurns: 7\n"
+                "---\n"
+                "You review code and report concrete risks.\n",
+                encoding="utf-8",
+            )
+
+            agents = {agent.agent_type: agent for agent in get_active_agents(tmp)}
+            self.assertIn("code-reviewer", agents)
+            self.assertEqual(agents["code-reviewer"].tools, ["Read", "Grep"])
+            self.assertTrue(agents["code-reviewer"].background)
+            self.assertEqual(agents["code-reviewer"].max_turns, 7)
+
+            schema = AgentTool(all_tools=[], api_client=None, cwd=tmp).get_schema()
+            self.assertIn("code-reviewer", schema["properties"]["subagent_type"]["enum"])
+
     def test_async_agent_tool_pool_blocks_main_thread_only_tools(self):
         pool = build_builtin_tools()
         resolved = _resolve_tools(None, pool)
@@ -924,6 +1112,35 @@ class AgentToolFilteringFidelityTests(unittest.TestCase):
         ctx = ToolContext(cwd=".", permission_mode="default", confirm_fn=lambda *args: True)
         result = run(search.call({"query": "select:AskUserQuestion"}, ctx))
         self.assertIn("Missing requested tools: AskUserQuestion", result)
+
+
+class ServerFidelityTests(unittest.TestCase):
+    def test_server_engine_uses_full_tool_pool_and_non_bypass_default(self):
+        try:
+            import server
+        except SystemExit as exc:
+            self.skipTest(f"server dependencies unavailable: {exc}")
+
+        async def scenario(tmp: str) -> tuple[set[str], str]:
+            old_api_key = server.API_KEY
+            old_mode = server.SERVER_PERMISSION_MODE
+            try:
+                server.API_KEY = "test"
+                server.SERVER_PERMISSION_MODE = "dontAsk"
+                engine = await server._build_engine(tmp)
+                return {tool.name for tool in engine.tools}, engine.permission_mode
+            finally:
+                server.API_KEY = old_api_key
+                server.SERVER_PERMISSION_MODE = old_mode
+
+        with tempfile.TemporaryDirectory() as tmp:
+            names, mode = run(scenario(tmp))
+
+        self.assertEqual(mode, "dontAsk")
+        self.assertIn("PowerShell", names)
+        self.assertIn("ToolSearch", names)
+        self.assertIn("TodoWrite", names)
+        self.assertIn("Agent", names)
 
 
 class McpFidelityTests(unittest.TestCase):
@@ -976,6 +1193,83 @@ class McpFidelityTests(unittest.TestCase):
         self.assertIn("mcp__local__echo", names)
         self.assertEqual("echo:hi", output)
         self.assertIn("mcp__local__echo", search_output)
+
+    def test_stdio_mcp_stderr_is_drained_while_waiting_for_reply(self):
+        async def scenario(tmp: str) -> list[dict]:
+            server = Path(tmp) / "stderr_mcp_server.py"
+            server.write_text(
+                "\n".join([
+                    "import json, sys",
+                    "sys.stderr.write('x' * 200000)",
+                    "sys.stderr.flush()",
+                    "for line in sys.stdin:",
+                    "    msg = json.loads(line)",
+                    "    if 'id' not in msg:",
+                    "        continue",
+                    "    method = msg.get('method')",
+                    "    if method == 'initialize':",
+                    "        result = {'protocolVersion': '2024-11-05', 'capabilities': {}, 'serverInfo': {'name': 'stderr-heavy'}}",
+                    "    elif method == 'tools/list':",
+                    "        result = {'tools': []}",
+                    "    else:",
+                    "        result = {}",
+                    "    print(json.dumps({'jsonrpc': '2.0', 'id': msg['id'], 'result': result}), flush=True)",
+                ]),
+                encoding="utf-8",
+            )
+            client = McpStdioClient(McpServerConfig(
+                name="stderr-heavy",
+                command=sys.executable,
+                args=[str(server)],
+                cwd=tmp,
+            ))
+            old_timeout = mcp_module.MCP_REQUEST_TIMEOUT_SECONDS
+            mcp_module.MCP_REQUEST_TIMEOUT_SECONDS = 5
+            try:
+                await client.initialize()
+                return await client.list_tools()
+            finally:
+                mcp_module.MCP_REQUEST_TIMEOUT_SECONDS = old_timeout
+                await client.close()
+
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertEqual(run(scenario(tmp)), [])
+
+    def test_stdio_mcp_timeout_closes_process(self):
+        async def scenario(tmp: str) -> tuple[str, bool]:
+            server = Path(tmp) / "hung_mcp_server.py"
+            server.write_text(
+                "\n".join([
+                    "import sys, time",
+                    "for line in sys.stdin:",
+                    "    time.sleep(60)",
+                ]),
+                encoding="utf-8",
+            )
+            client = McpStdioClient(McpServerConfig(
+                name="hung",
+                command=sys.executable,
+                args=[str(server)],
+                cwd=tmp,
+            ))
+            old_timeout = mcp_module.MCP_REQUEST_TIMEOUT_SECONDS
+            mcp_module.MCP_REQUEST_TIMEOUT_SECONDS = 0.1
+            try:
+                try:
+                    await client.initialize()
+                except RuntimeError as exc:
+                    proc_closed = client._proc is None
+                    return str(exc), proc_closed
+                self.fail("initialize should time out")
+            finally:
+                mcp_module.MCP_REQUEST_TIMEOUT_SECONDS = old_timeout
+                await client.close()
+
+        with tempfile.TemporaryDirectory() as tmp:
+            message, proc_closed = run(scenario(tmp))
+
+        self.assertIn("timed out replying to initialize", message)
+        self.assertTrue(proc_closed)
 
 
 if __name__ == "__main__":

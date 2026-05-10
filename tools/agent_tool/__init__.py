@@ -32,7 +32,7 @@ from .built_in_agents import (
     AGENT_TOOL_NAME,
     ONE_SHOT_AGENT_TYPES,
     get_agent_by_type,
-    get_built_in_agents,
+    get_active_agents,
 )
 from .color_manager import assign_agent_color, color_label
 from .run_agent import run_agent, AgentAbortError
@@ -116,6 +116,7 @@ class AgentTool(Tool):
         all_tools: list[Tool],
         api_client: Any,
         max_turns: int = 20,
+        cwd: str | None = None,
         # abort_event is shared across all sync sub-agents spawned from the same
         # parent session; set by QueryEngine.abort() on Ctrl+C
         abort_event: asyncio.Event | None = None,
@@ -123,19 +124,23 @@ class AgentTool(Tool):
         self._all_tools = all_tools
         self._api_client = api_client
         self._max_turns = max_turns
+        self._cwd = cwd
         self._abort_event = abort_event or asyncio.Event()
 
     # ── Schema ────────────────────────────────────────────────────────────────
 
-    def _build_description(self) -> str:
+    def _build_description(self, cwd: str | None = None) -> str:
         """
         Dynamic description listing all agent types.
         Mirrors formatAgentLine() + getPrompt() in AgentTool/prompt.ts.
         """
-        agents = get_built_in_agents()
+        agents = get_active_agents(cwd or self._cwd)
         lines: list[str] = [
             "Launch a new agent to handle complex, multi-step tasks. "
-            "Each agent type has specific capabilities and tools available to it.\n",
+            "Each agent type has specific capabilities and tools available to it. "
+            "Use this when an agent description matches the task, when the user asks "
+            "for delegation/subagents/parallel work, or when a specialized agent can "
+            "work autonomously without polluting the main context.\n",
             "Available agent types and the tools they have access to:",
         ]
         for agent in agents:
@@ -154,14 +159,23 @@ class AgentTool(Tool):
             )
         lines.append(
             "\n**IMPORTANT:** Before spawning a new agent, check if there is already "
-            "a running or recently completed agent that you can continue. "
-            "Only use this tool when the user explicitly says to use a subagent, "
-            "or names one of the agent types above."
+            "a running or recently completed agent that you can continue. Each fresh "
+            "Agent invocation starts without the parent conversation unless explicitly "
+            "forked by a future implementation, so brief it with the needed context. "
+            "If the user asks for agents in parallel, send multiple Agent tool calls "
+            "in the same assistant message."
+        )
+        lines.append(
+            "\nUsage notes:\n"
+            "- Always include a short description (3-5 words).\n"
+            "- Foreground agents return one result to you; summarize it for the user.\n"
+            "- Use run_in_background for genuinely independent work.\n"
+            "- Clearly tell the agent whether to write code or only research."
         )
         return "\n".join(lines)
 
     def get_schema(self) -> dict:
-        agent_types = [a.agent_type for a in get_built_in_agents()]
+        agent_types = [a.agent_type for a in get_active_agents(self._cwd)]
         return {
             "type": "object",
             "properties": {
@@ -246,6 +260,7 @@ class AgentTool(Tool):
             all_tools=base_pool,
             api_client=self._api_client,
             max_turns=max(5, self._max_turns // 2),
+            cwd=self._cwd,
             abort_event=self._abort_event,   # share abort signal chain
         )
         return base_pool + [sub_agent_tool], sub_agent_tool
@@ -256,19 +271,25 @@ class AgentTool(Tool):
         description: str  = input.get("description") or "Agent task"
         prompt: str       = input["prompt"]
         subagent_type: str = input.get("subagent_type") or "general-purpose"
-        run_in_bg: bool   = bool(input.get("run_in_background", False))
-        isolation: str | None = input.get("isolation")
-        model_override: str | None = input.get("model") or None
 
         # Abort check before even starting
         if self._abort_event.is_set():
             return "<error>Agent aborted before start.</error>"
 
         # Resolve agent definition
-        definition = get_agent_by_type(subagent_type)
+        definition = get_agent_by_type(subagent_type, ctx.cwd)
         if definition is None:
             subagent_type = "general-purpose"
-            definition = get_agent_by_type("general-purpose")
+            definition = get_agent_by_type("general-purpose", ctx.cwd)
+
+        run_in_bg: bool = bool(input.get("run_in_background", False)) or bool(getattr(definition, "background", False))
+        isolation: str | None = input.get("isolation") or getattr(definition, "isolation", None)
+        model_override: str | None = (
+            input.get("model")
+            or (definition.model if definition and definition.model not in (None, "inherit") else None)
+        )
+        child_permission_mode = getattr(definition, "permission_mode", None) or ctx.permission_mode
+        child_max_turns = getattr(definition, "max_turns", None) or self._max_turns
 
         assign_agent_color(subagent_type)
         badge = color_label(subagent_type)
@@ -323,6 +344,8 @@ class AgentTool(Tool):
                     session_transcript_path=session_transcript_path,
                     parent_session_id=parent_session_id,
                     model_override=model_override,
+                    permission_mode=child_permission_mode,
+                    max_turns=child_max_turns,
                 )
 
             result = await run_agent(
@@ -331,11 +354,11 @@ class AgentTool(Tool):
                 api_client=self._api_client,
                 cwd=agent_cwd,
                 base_system_prompt=system_prompt,
-                permission_mode=ctx.permission_mode,
+                permission_mode=child_permission_mode,
                 always_allow=getattr(ctx, "always_allow", []),
                 always_deny=getattr(ctx, "always_deny", []),
                 always_ask=getattr(ctx, "always_ask", []),
-                max_turns=self._max_turns,
+                max_turns=child_max_turns,
                 agent_id=agent_id,
                 agent_type=subagent_type,
                 parent_session_id=parent_session_id,
@@ -391,6 +414,8 @@ class AgentTool(Tool):
         session_transcript_path: Path,
         parent_session_id: str,
         model_override: str | None = None,
+        permission_mode: str | None = None,
+        max_turns: int | None = None,
     ) -> str:
         """
         Fire-and-forget via asyncio.create_task().
@@ -416,11 +441,11 @@ class AgentTool(Tool):
                     api_client=self._api_client,
                     cwd=agent_cwd,
                     base_system_prompt=system_prompt,
-                    permission_mode=ctx.permission_mode,
+                    permission_mode=permission_mode or ctx.permission_mode,
                     always_allow=getattr(ctx, "always_allow", []),
                     always_deny=getattr(ctx, "always_deny", []),
                     always_ask=getattr(ctx, "always_ask", []),
-                    max_turns=self._max_turns,
+                    max_turns=max_turns or self._max_turns,
                     agent_id=agent_id,
                     agent_type=subagent_type,
                     parent_session_id=parent_session_id,

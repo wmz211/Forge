@@ -95,3 +95,98 @@ class Tool:
                 "parameters": self.get_schema(),
             },
         }
+
+
+def validate_json_schema_value(value: Any, schema: dict, path: str = "input") -> str | None:
+    """
+    Lightweight validator for the JSON-schema subset used by tool parameters.
+    Mirrors the source runtime's schema safeParse gate without adding a dependency.
+    """
+    if not isinstance(schema, dict):
+        return None
+
+    expected = schema.get("type")
+    if expected is not None and not _matches_json_type(value, expected):
+        expected_text = " or ".join(expected) if isinstance(expected, list) else str(expected)
+        return f"{path} must be {expected_text}, got {_json_type_name(value)}"
+
+    enum = schema.get("enum")
+    if isinstance(enum, list) and value not in enum:
+        return f"{path} must be one of {enum!r}"
+
+    if schema.get("type") == "object" or (
+        isinstance(value, dict) and "properties" in schema
+    ):
+        if not isinstance(value, dict):
+            return f"{path} must be object, got {_json_type_name(value)}"
+        properties = schema.get("properties") if isinstance(schema.get("properties"), dict) else {}
+        required = schema.get("required") if isinstance(schema.get("required"), list) else []
+        for key in required:
+            if key not in value:
+                return f"{path}.{key} is required"
+        for key, child_schema in properties.items():
+            if key in value:
+                error = validate_json_schema_value(value[key], child_schema, f"{path}.{key}")
+                if error:
+                    return error
+
+    if schema.get("type") == "array" or (
+        isinstance(value, list) and "items" in schema
+    ):
+        if not isinstance(value, list):
+            return f"{path} must be array, got {_json_type_name(value)}"
+        item_schema = schema.get("items")
+        if isinstance(item_schema, dict):
+            for idx, item in enumerate(value):
+                error = validate_json_schema_value(item, item_schema, f"{path}[{idx}]")
+                if error:
+                    return error
+
+    return None
+
+
+def validate_tool_input_schema(tool: Tool, input: dict[str, Any]) -> tuple[bool, str | None]:
+    try:
+        schema = tool.get_schema()
+    except Exception as exc:
+        return False, f"Invalid tool schema for {tool.name}: {exc}"
+    error = validate_json_schema_value(input, schema, "input")
+    return (error is None, error)
+
+
+def _matches_json_type(value: Any, expected: Any) -> bool:
+    if isinstance(expected, list):
+        return any(_matches_json_type(value, item) for item in expected)
+    if expected == "object":
+        return isinstance(value, dict)
+    if expected == "array":
+        return isinstance(value, list)
+    if expected == "string":
+        return isinstance(value, str)
+    if expected == "integer":
+        return isinstance(value, int) and not isinstance(value, bool)
+    if expected == "number":
+        return (isinstance(value, int) or isinstance(value, float)) and not isinstance(value, bool)
+    if expected == "boolean":
+        return isinstance(value, bool)
+    if expected == "null":
+        return value is None
+    return True
+
+
+def _json_type_name(value: Any) -> str:
+    if value is None:
+        return "null"
+    if isinstance(value, bool):
+        return "boolean"
+    if isinstance(value, dict):
+        return "object"
+    if isinstance(value, list):
+        return "array"
+    if isinstance(value, str):
+        return "string"
+    if isinstance(value, int):
+        return "integer"
+    if isinstance(value, float):
+        return "number"
+    return type(value).__name__
